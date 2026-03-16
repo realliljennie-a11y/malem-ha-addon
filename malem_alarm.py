@@ -139,21 +139,40 @@ def generate_auth_response(tempid: int) -> bytes:
 
 # ── BLE connection ────────────────────────────────────────────────────────────
 
-async def connect_fast(address: str) -> BleakClient:
+async def scan_for_device(address: str):
     """
-    Connect to the device with the pre-connect scan bypassed.
-    Service discovery is NOT bypassed here — instead auth_via_dbus() does
-    auth before discovery completes, then discovery finishes at leisure.
+    Scan briefly to register the device with BlueZ and get a BLEDevice object
+    with the correct D-Bus path. BlueZ requires a device to be seen via scan
+    before it can be connected to — we can't construct the path ourselves.
+    Returns as soon as the advertisement is seen.
     """
-    mac_nodash = address.upper().replace(":", "_")
-    device_path = f"/org/bluez/hci0/dev_{mac_nodash}"
+    log.info(f"Scanning for {address}...")
+    found = asyncio.Event()
+    result = [None]
 
-    client = BleakClient(address, timeout=15.0)
-    # Pre-set device path to skip BleakScanner.find_device_by_address()
-    client._backend._device_path = device_path
+    def on_device(device, adv):
+        if device.address.upper() == address.upper():
+            result[0] = device
+            found.set()
 
-    # Use cache if available (dangerous_use_bleak_cache skips BLE re-discovery
-    # if BlueZ has previously cached this device's services)
+    async with BleakScanner(detection_callback=on_device):
+        await asyncio.wait_for(found.wait(), timeout=30.0)
+
+    log.info(f"Device found (RSSI {getattr(result[0], 'rssi', '?')  } dBm)")
+    return result[0]
+
+
+async def connect_fast(ble_device) -> BleakClient:
+    """
+    Connect using a BLEDevice object from scan_for_device().
+    Passing BLEDevice directly sets _device_path from device.details["path"],
+    giving BlueZ the correct D-Bus object path without manual construction.
+    Service discovery runs concurrently; auth_via_dbus() does auth before
+    it completes so we stay within the device's 3-second auth window.
+    Uses dangerous_use_bleak_cache=True so if BlueZ has previously seen
+    this device it skips BLE re-discovery entirely.
+    """
+    client = BleakClient(ble_device, timeout=15.0)
     await client.connect(dangerous_use_bleak_cache=True)
 
     if not client.is_connected:
@@ -562,8 +581,9 @@ async def main():
 
     while True:
         try:
+            ble_device = await scan_for_device(address)
             log.info(f"Connecting to {address}...")
-            client = await connect_fast(address)
+            client = await connect_fast(ble_device)
             log.info("Connected")
 
             try:
