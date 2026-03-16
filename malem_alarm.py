@@ -7,12 +7,16 @@ On first run the add-on scans for the sensor by name and saves its MAC
 address to /config/malem_state.json. On all subsequent runs the MAC is
 loaded from that file — no manual configuration required.
 
-Service discovery is bypassed entirely by monkey-patching the bleak BlueZ
-backend's _get_services() method to return an empty collection immediately.
-All GATT operations use UUID strings (not handle numbers), so this is safe —
-bleak resolves UUIDs to handles lazily on first use via D-Bus, which is fast
-because it only looks up the specific characteristic needed rather than
-enumerating all services.
+Connection strategy:
+  The Malem device disconnects if auth doesn't complete within ~3 seconds.
+  Bleak's normal connect() does two slow things: a pre-connect BLE scan, and
+  service discovery (waiting for BlueZ ServicesResolved). We bypass both:
+
+  1. Pre-set _device_path so the pre-connect scan is skipped.
+  2. Auth using raw D-Bus calls (GetManagedObjects to find characteristic
+     paths, then ReadValue/WriteValue directly) — this is fast because it
+     uses the D-Bus object manager cache, not BLE traffic.
+  3. After auth, trigger normal service discovery at leisure (no time limit).
 
 MQTT topics published:
   {prefix}/moisture/state          "wet" | "dry"
@@ -85,50 +89,228 @@ TOPIC_BATTERY_STATE  = f"{TOPIC_PREFIX}/battery/state"
 TOPIC_DISC_MOISTURE  = f"homeassistant/binary_sensor/{TOPIC_PREFIX}_moisture/config"
 TOPIC_DISC_BATTERY   = f"homeassistant/sensor/{TOPIC_PREFIX}_battery/config"
 
+# ── auth key generation ───────────────────────────────────────────────────────
+
+def generate_auth_response(tempid: int) -> bytes:
+    ranXOR = KEY_TABLE[tempid]
+
+    temp1 = random.randint(0, 255)
+    temp2 = random.randint(0, 255)
+    temp3 = random.randint(128, 255)
+    temp4 = random.randint(0, 255)
+    temp5 = random.randint(128, 255)
+
+    t1 = temp1 >> 4;  t2 = temp1 & 0xF
+    t3 = temp2 >> 4;  t4 = temp2 & 0xF
+    t5 = temp3 >> 4;  t6 = temp3 & 0xF
+    t7 = temp4 >> 4;  t8 = temp4 & 0xF
+    t9 = temp5 >> 4;  t10 = temp5 & 0xF
+
+    ans = ((t1 + t6 + t7) * (t3 + t4)) + ((t5 + t10) * t9) + t2 + t8
+
+    send = [0] * 20
+    send[0]  = ranXOR ^ 0x57
+    send[1]  = ranXOR ^ 0x8B
+    send[2]  = ranXOR ^ 0x33
+    send[3]  = ranXOR ^ 0x17
+    send[4]  = ranXOR ^ 0xCE
+    send[5]  = ranXOR ^ 0xA0
+    send[6]  = ranXOR ^ 0x99
+    send[7]  = ranXOR ^ 0x85
+    send[8]  = ranXOR ^ 0x02
+    send[9]  = ranXOR ^ temp1
+    send[10] = ranXOR ^ temp2
+    send[11] = ranXOR ^ temp3
+    send[12] = ranXOR ^ temp4
+    send[13] = ranXOR ^ temp5
+    send[14] = tempid
+    send[15] = ranXOR ^ 0x4F
+    send[16] = ranXOR ^ 0x2A
+    send[17] = ranXOR ^ 0xE1
+    send[18] = ranXOR ^ ((ans >> 8) & 0xFF)
+    send[19] = ranXOR ^ (ans & 0xFF)
+
+    for i in range(20):
+        send[i] ^= 0x13
+        send[i] ^= 0x46
+
+    return bytes(send)
+
+
 # ── BLE connection ────────────────────────────────────────────────────────────
 
-async def connect_with_known_services(address: str) -> BleakClient:
+async def connect_fast(address: str) -> BleakClient:
     """
-    Connect to the device bypassing both the pre-connect scan and GATT
-    service discovery.
-
-    Two things in bleak's connect() normally consume the Malem device's
-    3-second auth window:
-
-    1. BleakScanner.find_device_by_address() — a scan that runs if
-       _device_path is not already set.
-    2. _get_services() — waits for BlueZ ServicesResolved signal.
-
-    We bypass both:
-    - Pre-set _device_path from the known MAC address so the scan is skipped.
-    - Pre-set client.services to an empty collection. _get_services() checks
-      "if self.services is not None: return self.services" at the top, so it
-      returns immediately without querying BlueZ at all.
-
-    All GATT operations use UUID strings; bleak resolves these to D-Bus object
-    paths lazily on first use, which is fast (one object lookup, not a full
-    service tree enumeration).
+    Connect to the device with the pre-connect scan bypassed.
+    Service discovery is NOT bypassed here — instead auth_via_dbus() does
+    auth before discovery completes, then discovery finishes at leisure.
     """
     mac_nodash = address.upper().replace(":", "_")
     device_path = f"/org/bluez/hci0/dev_{mac_nodash}"
 
     client = BleakClient(address, timeout=15.0)
-
-    # Skip pre-connect scan
+    # Pre-set device path to skip BleakScanner.find_device_by_address()
     client._backend._device_path = device_path
-    log.debug(f"Pre-set device path: {device_path}")
 
-    # Skip service discovery — _get_services returns immediately if services is set
-    client._backend.services = BleakGATTServiceCollection()
-
-    await client.connect()
+    # Use cache if available (dangerous_use_bleak_cache skips BLE re-discovery
+    # if BlueZ has previously cached this device's services)
+    await client.connect(dangerous_use_bleak_cache=True)
 
     if not client.is_connected:
         raise BleakError("Failed to connect")
 
-    log.info("Connected (scan + GATT discovery bypassed)")
     return client
 
+
+async def auth_via_dbus(client: BleakClient) -> bool:
+    """
+    Authenticate using raw D-Bus calls, bypassing the service collection.
+
+    Uses BlueZ's GetManagedObjects to find characteristic D-Bus paths for
+    our specific UUIDs — one fast D-Bus roundtrip with no BLE traffic.
+    This completes well within the 3-second auth window even when service
+    discovery is still in progress.
+    """
+    from dbus_fast.message import Message
+    from dbus_fast.signature import Variant
+    from bleak.backends.bluezdbus import defs
+
+    bus = client._backend._bus
+    device_path = client._backend._device_path
+
+    if bus is None or device_path is None:
+        log.error("Auth failed: no D-Bus connection")
+        return False
+
+    # Get all BlueZ objects in one D-Bus call — uses kernel object cache,
+    # not BLE traffic, so this is fast regardless of discovery state
+    try:
+        reply = await bus.call(
+            Message(
+                destination=defs.BLUEZ_SERVICE,
+                path="/",
+                interface=defs.OBJECT_MANAGER_INTERFACE,
+                member="GetManagedObjects",
+            )
+        )
+    except Exception as e:
+        log.error(f"GetManagedObjects failed: {e}")
+        return False
+
+    if reply.message_type.name == "ERROR":
+        log.error(f"GetManagedObjects error: {reply.error_name}")
+        return False
+
+    objects = reply.body[0]
+
+    # Find D-Bus paths for our two auth characteristics
+    challenge_path = None
+    write_path = None
+
+    for path, interfaces in objects.items():
+        if not path.startswith(device_path):
+            continue
+        char_iface = interfaces.get(defs.GATT_CHARACTERISTIC_INTERFACE)
+        if char_iface is None:
+            continue
+        uuid_variant = char_iface.get("UUID", {})
+        uuid_val = uuid_variant.value if hasattr(uuid_variant, "value") else str(uuid_variant)
+        if uuid_val.lower() == CHAR_AUTH_CHALLENGE.lower():
+            challenge_path = path
+        elif uuid_val.lower() == CHAR_AUTH_WRITE.lower():
+            write_path = path
+
+    if not challenge_path or not write_path:
+        log.error("Auth characteristics not found in D-Bus objects")
+        log.debug(f"Paths under {device_path}: "
+                  f"{[p for p in objects if p.startswith(device_path)]}")
+        return False
+
+    log.debug(f"Challenge: {challenge_path}")
+    log.debug(f"Write:     {write_path}")
+
+    try:
+        t0 = time.monotonic()
+
+        # Read challenge byte
+        reply = await bus.call(
+            Message(
+                destination=defs.BLUEZ_SERVICE,
+                path=challenge_path,
+                interface=defs.GATT_CHARACTERISTIC_INTERFACE,
+                member="ReadValue",
+                signature="a{sv}",
+                body=[{}],
+            )
+        )
+        if reply.message_type.name == "ERROR":
+            log.error(f"Challenge read failed: {reply.error_name}")
+            return False
+
+        tempid = reply.body[0][0] & 0xFF
+        response = generate_auth_response(tempid)
+
+        # Write auth response
+        reply = await bus.call(
+            Message(
+                destination=defs.BLUEZ_SERVICE,
+                path=write_path,
+                interface=defs.GATT_CHARACTERISTIC_INTERFACE,
+                member="WriteValue",
+                signature="aya{sv}",
+                body=[bytes(response), {"type": Variant("s", "request")}],
+            )
+        )
+        if reply.message_type.name == "ERROR":
+            log.error(f"Auth write failed: {reply.error_name}")
+            return False
+
+        log.info(f"Authenticated in {time.monotonic()-t0:.2f}s")
+        return True
+
+    except Exception as e:
+        log.error(f"Auth failed: {e}")
+        return False
+
+
+async def wait_for_services(client: BleakClient, timeout: float = 10.0) -> bool:
+    """
+    Wait for service discovery to complete after auth.
+    No time pressure here — device stays connected indefinitely once authed.
+    """
+    if client.services is not None:
+        return True
+
+    log.info("Waiting for service discovery to complete...")
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        if client.services is not None:
+            log.info("Services resolved")
+            return True
+        await asyncio.sleep(0.2)
+
+    # Try forcing discovery via _get_services
+    try:
+        await client._backend._get_services()
+        log.info("Services resolved via _get_services()")
+        return True
+    except Exception as e:
+        log.error(f"Service discovery failed: {e}")
+        return False
+
+
+# ── battery ───────────────────────────────────────────────────────────────────
+
+async def read_battery(client: BleakClient) -> int | None:
+    try:
+        data = await client.read_gatt_char(CHAR_BATTERY)
+        level = data[0] & 0xFF
+        log.info(f"Battery level: {level}%")
+        return level
+    except BleakError:
+        log.info("Battery characteristic not available on this device")
+        return None
 
 
 # ── state file ────────────────────────────────────────────────────────────────
@@ -235,81 +417,6 @@ def publish_moisture(state: str, attributes: dict = None):
 def publish_battery(level: int):
     mqtt_client.publish(TOPIC_BATTERY_STATE, str(level), retain=True)
     log.info(f"Battery → {level}%")
-
-
-# ── auth ──────────────────────────────────────────────────────────────────────
-
-def generate_auth_response(tempid: int) -> bytes:
-    ranXOR = KEY_TABLE[tempid]
-
-    temp1 = random.randint(0, 255)
-    temp2 = random.randint(0, 255)
-    temp3 = random.randint(128, 255)
-    temp4 = random.randint(0, 255)
-    temp5 = random.randint(128, 255)
-
-    t1 = temp1 >> 4;  t2 = temp1 & 0xF
-    t3 = temp2 >> 4;  t4 = temp2 & 0xF
-    t5 = temp3 >> 4;  t6 = temp3 & 0xF
-    t7 = temp4 >> 4;  t8 = temp4 & 0xF
-    t9 = temp5 >> 4;  t10 = temp5 & 0xF
-
-    ans = ((t1 + t6 + t7) * (t3 + t4)) + ((t5 + t10) * t9) + t2 + t8
-
-    send = [0] * 20
-    send[0]  = ranXOR ^ 0x57
-    send[1]  = ranXOR ^ 0x8B
-    send[2]  = ranXOR ^ 0x33
-    send[3]  = ranXOR ^ 0x17
-    send[4]  = ranXOR ^ 0xCE
-    send[5]  = ranXOR ^ 0xA0
-    send[6]  = ranXOR ^ 0x99
-    send[7]  = ranXOR ^ 0x85
-    send[8]  = ranXOR ^ 0x02
-    send[9]  = ranXOR ^ temp1
-    send[10] = ranXOR ^ temp2
-    send[11] = ranXOR ^ temp3
-    send[12] = ranXOR ^ temp4
-    send[13] = ranXOR ^ temp5
-    send[14] = tempid
-    send[15] = ranXOR ^ 0x4F
-    send[16] = ranXOR ^ 0x2A
-    send[17] = ranXOR ^ 0xE1
-    send[18] = ranXOR ^ ((ans >> 8) & 0xFF)
-    send[19] = ranXOR ^ (ans & 0xFF)
-
-    for i in range(20):
-        send[i] ^= 0x13
-        send[i] ^= 0x46
-
-    return bytes(send)
-
-
-async def authenticate(client: BleakClient) -> bool:
-    try:
-        t0 = time.monotonic()
-        challenge = await client.read_gatt_char(CHAR_AUTH_CHALLENGE)
-        tempid = challenge[0] & 0xFF
-        response = generate_auth_response(tempid)
-        await client.write_gatt_char(CHAR_AUTH_WRITE, response, response=True)
-        log.info(f"Authenticated in {time.monotonic()-t0:.2f}s")
-        return True
-    except BleakError as e:
-        log.error(f"Auth failed: {e}")
-        return False
-
-
-# ── battery ───────────────────────────────────────────────────────────────────
-
-async def read_battery(client: BleakClient) -> int | None:
-    try:
-        data = await client.read_gatt_char(CHAR_BATTERY)
-        level = data[0] & 0xFF
-        log.info(f"Battery level: {level}%")
-        return level
-    except BleakError:
-        log.info("Battery characteristic not available on this device")
-        return None
 
 
 # ── monitor ───────────────────────────────────────────────────────────────────
@@ -456,17 +563,24 @@ async def main():
     while True:
         try:
             log.info(f"Connecting to {address}...")
-            client = await connect_with_known_services(address)
+            client = await connect_fast(address)
+            log.info("Connected")
 
             try:
                 mqtt_client.publish(TOPIC_AVAILABILITY, "online", retain=True)
 
-                if not await authenticate(client):
+                # Auth via raw D-Bus before service discovery completes
+                if not await auth_via_dbus(client):
                     failures += 1
                     await asyncio.sleep(3)
                     continue
 
                 failures = 0
+
+                # Now wait for service discovery to complete — no time pressure
+                if not await wait_for_services(client):
+                    log.error("Service discovery failed — reconnecting")
+                    continue
 
                 battery = await read_battery(client)
                 has_battery = battery is not None
