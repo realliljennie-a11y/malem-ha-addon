@@ -3,6 +3,12 @@ Malem Alarm — Home Assistant Add-on
 Listens for Malem BLE moisture sensor events and publishes to MQTT
 with Home Assistant MQTT discovery, so the sensor auto-appears in HA.
 
+On first run the add-on scans for the sensor by name, saves its MAC address
+to /config/malem_state.json, then restarts itself so run.sh can pre-cache
+the BlueZ GATT services before the next connection attempt. On all subsequent
+runs the MAC is loaded from the state file and used directly — no user
+configuration of the MAC address required.
+
 MQTT topics published:
   {prefix}/moisture/state          "wet" | "dry"
   {prefix}/moisture/attributes     JSON: last_wet_duration, last_wet_time
@@ -19,6 +25,7 @@ import json
 import logging
 import os
 import random
+import sys
 import time
 from datetime import datetime
 
@@ -36,6 +43,11 @@ MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
 TOPIC_PREFIX  = os.environ.get("MQTT_TOPIC_PREFIX", "malem")
 DRY_TIMEOUT   = int(os.environ.get("DRY_TIMEOUT", 15))
 LOG_LEVEL     = os.environ.get("LOG_LEVEL", "info").upper()
+# Optional manual override — if set, skips scan and state file entirely
+SENSOR_MAC_OVERRIDE = os.environ.get("SENSOR_MAC", "").strip().upper()
+
+# State file lives in /config which is the HA config directory (mounted rw)
+STATE_FILE = "/config/malem_state.json"
 
 # ── logging ───────────────────────────────────────────────────────────────────
 
@@ -48,26 +60,44 @@ log = logging.getLogger("malem")
 
 # ── BLE constants ─────────────────────────────────────────────────────────────
 
-DEVICE_NAME         = "MALEM ALARM"
-CHAR_AUTH_WRITE     = "0000fff1-0000-1000-8000-00805f9b34fb"
-CHAR_AUTH_CHALLENGE = "0000fff2-0000-1000-8000-00805f9b34fb"
-CHAR_STATUS         = "0000fff4-0000-1000-8000-00805f9b34fb"
-CHAR_BATTERY        = "00002a19-0000-1000-8000-00805f9b34fb"  # standard BLE battery
+DEVICE_NAME           = "MALEM ALARM"
+CHAR_AUTH_WRITE       = "0000fff1-0000-1000-8000-00805f9b34fb"
+CHAR_AUTH_CHALLENGE   = "0000fff2-0000-1000-8000-00805f9b34fb"
+CHAR_STATUS           = "0000fff4-0000-1000-8000-00805f9b34fb"
+CHAR_BATTERY          = "00002a19-0000-1000-8000-00805f9b34fb"
 
 KEY_TABLE = [0x79, 0xA8, 0xBF, 0x90, 0x88, 0x3E, 0x45, 0x13,
              0x46, 0x6C, 0xF9, 0xD7, 0x20, 0xCA, 0x58, 0xDA]
 
-POLL_INTERVAL         = 1.5   # seconds between status polls
-BATTERY_POLL_INTERVAL = 300   # seconds between battery reads (5 min)
+POLL_INTERVAL         = 1.5
+BATTERY_POLL_INTERVAL = 300
 
 # ── MQTT topics ───────────────────────────────────────────────────────────────
 
-TOPIC_MOISTURE_STATE  = f"{TOPIC_PREFIX}/moisture/state"
-TOPIC_MOISTURE_ATTRS  = f"{TOPIC_PREFIX}/moisture/attributes"
-TOPIC_AVAILABILITY    = f"{TOPIC_PREFIX}/moisture/availability"
-TOPIC_BATTERY_STATE   = f"{TOPIC_PREFIX}/battery/state"
-TOPIC_DISC_MOISTURE   = f"homeassistant/binary_sensor/{TOPIC_PREFIX}_moisture/config"
-TOPIC_DISC_BATTERY    = f"homeassistant/sensor/{TOPIC_PREFIX}_battery/config"
+TOPIC_MOISTURE_STATE = f"{TOPIC_PREFIX}/moisture/state"
+TOPIC_MOISTURE_ATTRS = f"{TOPIC_PREFIX}/moisture/attributes"
+TOPIC_AVAILABILITY   = f"{TOPIC_PREFIX}/moisture/availability"
+TOPIC_BATTERY_STATE  = f"{TOPIC_PREFIX}/battery/state"
+TOPIC_DISC_MOISTURE  = f"homeassistant/binary_sensor/{TOPIC_PREFIX}_moisture/config"
+TOPIC_DISC_BATTERY   = f"homeassistant/sensor/{TOPIC_PREFIX}_battery/config"
+
+# ── state file ────────────────────────────────────────────────────────────────
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        log.error(f"Failed to save state: {e}")
+
 
 # ── MQTT ──────────────────────────────────────────────────────────────────────
 
@@ -207,7 +237,6 @@ def generate_auth_response(tempid: int) -> bytes:
 
 
 async def authenticate(client: BleakClient) -> bool:
-    """Complete challenge-response. Must finish within ~3s of connect."""
     try:
         t0 = time.monotonic()
         challenge = await client.read_gatt_char(CHAR_AUTH_CHALLENGE)
@@ -224,11 +253,6 @@ async def authenticate(client: BleakClient) -> bool:
 # ── battery ───────────────────────────────────────────────────────────────────
 
 async def read_battery(client: BleakClient) -> int | None:
-    """
-    Attempt to read the standard BLE Battery Level characteristic (0x2A19).
-    Returns 0-100 if present, None if the device doesn't support it.
-    Only called once after auth, then periodically during monitoring.
-    """
     try:
         data = await client.read_gatt_char(CHAR_BATTERY)
         level = data[0] & 0xFF
@@ -263,7 +287,6 @@ async def monitor(client: BleakClient, device_address: str, has_battery: bool):
             log.error(f"Poll error: {e}")
             break
 
-        # Process notifications first, then polled value if it differs
         to_process = []
         while pending:
             to_process.append(pending.pop(0))
@@ -305,7 +328,6 @@ async def monitor(client: BleakClient, device_address: str, has_battery: bool):
                         "status": "dry",
                     })
 
-        # Timeout fallback
         if wet and last_ab is not None:
             if time.monotonic() - last_ab > DRY_TIMEOUT:
                 local_secs = int(time.monotonic() - wet_start)
@@ -318,7 +340,6 @@ async def monitor(client: BleakClient, device_address: str, has_battery: bool):
                     "status": "dry (timeout)",
                 })
 
-        # Periodic battery read
         if has_battery and time.monotonic() - last_battery_read > BATTERY_POLL_INTERVAL:
             level = await read_battery(client)
             if level is not None:
@@ -333,13 +354,49 @@ async def monitor(client: BleakClient, device_address: str, has_battery: bool):
 
 # ── scanner ───────────────────────────────────────────────────────────────────
 
-async def find_device() -> tuple[str, int]:
-    log.info(f"Scanning for {DEVICE_NAME}...")
+async def find_and_save_device() -> str:
+    """
+    Scan for the sensor by name, save its MAC to the state file, then
+    exit with code 2 to signal run.sh to write the BlueZ cache and restart.
+    This only runs on first install (no MAC in state file or config override).
+    """
+    log.info(f"First run — scanning for {DEVICE_NAME} to discover MAC address...")
+    log.info("This may take up to 30 seconds.")
+
     found = asyncio.Event()
     result = [None, None]
 
     def on_device(device, adv):
         if device.name and DEVICE_NAME in device.name:
+            result[0] = device.address
+            result[1] = adv.rssi
+            found.set()
+
+    async with BleakScanner(detection_callback=on_device):
+        await asyncio.wait_for(found.wait(), timeout=60.0)
+
+    address, rssi = result
+    log.info(f"Found {DEVICE_NAME} at {address} (RSSI {rssi} dBm)")
+    log.info(f"Saving MAC address to {STATE_FILE}")
+
+    state = load_state()
+    state["sensor_mac"] = address
+    state["sensor_name"] = DEVICE_NAME
+    save_state(state)
+
+    log.info("MAC saved — restarting to apply BlueZ cache and connect...")
+    # Exit code 2 signals run.sh to write the cache and restart the addon
+    sys.exit(2)
+
+
+async def find_device(address: str) -> tuple[str, int]:
+    """Confirm a known device is advertising and return its current RSSI."""
+    log.info(f"Scanning for {address}...")
+    found = asyncio.Event()
+    result = [None, None]
+
+    def on_device(device, adv):
+        if device.address.upper() == address.upper():
             result[0] = device.address
             result[1] = adv.rssi
             found.set()
@@ -357,14 +414,24 @@ async def main():
     mqtt_connect()
     await asyncio.sleep(2)
 
-    address = None
+    # Determine MAC address — priority: config override → state file → first-run scan
+    if SENSOR_MAC_OVERRIDE:
+        address = SENSOR_MAC_OVERRIDE
+        log.info(f"Using MAC from config override: {address}")
+    else:
+        state = load_state()
+        if "sensor_mac" in state:
+            address = state["sensor_mac"].upper()
+            log.info(f"Using saved MAC address: {address}")
+        else:
+            # First run — scan, save, restart
+            await find_and_save_device()
+            return  # unreachable — find_and_save_device exits
+
     failures = 0
 
     while True:
         try:
-            if address is None:
-                address, rssi = await find_device()
-
             log.info(f"Connecting to {address}...")
             async with BleakClient(address, timeout=15.0) as client:
                 log.info("Connected")
@@ -377,7 +444,6 @@ async def main():
 
                 failures = 0
 
-                # Probe for battery once after auth
                 battery = await read_battery(client)
                 has_battery = battery is not None
                 if has_battery:
@@ -387,16 +453,14 @@ async def main():
                 await monitor(client, address, has_battery)
 
         except asyncio.TimeoutError:
-            log.warning("Scan timed out — rescanning")
-            address = None
+            log.warning("Scan timed out — retrying")
             await asyncio.sleep(2)
 
         except BleakError as e:
             failures += 1
             log.error(f"BLE error ({failures}): {e}")
             if failures % 3 == 0:
-                log.warning("3 consecutive failures — rescanning")
-                address = None
+                log.warning("3 consecutive failures — will retry")
             await asyncio.sleep(3)
 
         except Exception as e:
