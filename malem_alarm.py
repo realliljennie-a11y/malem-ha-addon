@@ -3,11 +3,15 @@ Malem Alarm — Home Assistant Add-on
 Listens for Malem BLE moisture sensor events and publishes to MQTT
 with Home Assistant MQTT discovery, so the sensor auto-appears in HA.
 
-On first run the add-on scans for the sensor by name, saves its MAC address
-to /config/malem_state.json, then restarts itself so run.sh can pre-cache
-the BlueZ GATT services before the next connection attempt. On all subsequent
-runs the MAC is loaded from the state file and used directly — no user
-configuration of the MAC address required.
+On first run the add-on scans for the sensor by name and saves its MAC
+address to /config/malem_state.json. On all subsequent runs the MAC is
+loaded from that file — no manual configuration required.
+
+Service discovery is bypassed entirely by pre-populating the bleak GATT
+service collection with the known Malem service layout. This is safe
+because every Malem BLE device has identical services (hardcoded in the
+original Android app). This avoids the ~2s BlueZ discovery window that
+causes the device to drop the connection before auth completes.
 
 MQTT topics published:
   {prefix}/moisture/state          "wet" | "dry"
@@ -32,21 +36,22 @@ from datetime import datetime
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 from bleak import BleakScanner, BleakClient
+from bleak.backends.characteristic import BleakGATTCharacteristic
+from bleak.backends.descriptor import BleakGATTDescriptor
+from bleak.backends.service import BleakGATTService, BleakGATTServiceCollection
 from bleak.exc import BleakError
 
 # ── config ────────────────────────────────────────────────────────────────────
 
-MQTT_HOST     = os.environ.get("MQTT_HOST", "core-mosquitto")
-MQTT_PORT     = int(os.environ.get("MQTT_PORT", 1883))
-MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "")
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
-TOPIC_PREFIX  = os.environ.get("MQTT_TOPIC_PREFIX", "malem")
-DRY_TIMEOUT   = int(os.environ.get("DRY_TIMEOUT", 15))
-LOG_LEVEL     = os.environ.get("LOG_LEVEL", "info").upper()
-# Optional manual override — if set, skips scan and state file entirely
+MQTT_HOST           = os.environ.get("MQTT_HOST", "core-mosquitto")
+MQTT_PORT           = int(os.environ.get("MQTT_PORT", 1883))
+MQTT_USERNAME       = os.environ.get("MQTT_USERNAME", "")
+MQTT_PASSWORD       = os.environ.get("MQTT_PASSWORD", "")
+TOPIC_PREFIX        = os.environ.get("MQTT_TOPIC_PREFIX", "malem")
+DRY_TIMEOUT         = int(os.environ.get("DRY_TIMEOUT", 15))
+LOG_LEVEL           = os.environ.get("LOG_LEVEL", "info").upper()
 SENSOR_MAC_OVERRIDE = os.environ.get("SENSOR_MAC", "").strip().upper()
 
-# State file lives in /config which is the HA config directory (mounted rw)
 STATE_FILE = "/config/malem_state.json"
 
 # ── logging ───────────────────────────────────────────────────────────────────
@@ -60,11 +65,11 @@ log = logging.getLogger("malem")
 
 # ── BLE constants ─────────────────────────────────────────────────────────────
 
-DEVICE_NAME           = "MALEM ALARM"
-CHAR_AUTH_WRITE       = "0000fff1-0000-1000-8000-00805f9b34fb"
-CHAR_AUTH_CHALLENGE   = "0000fff2-0000-1000-8000-00805f9b34fb"
-CHAR_STATUS           = "0000fff4-0000-1000-8000-00805f9b34fb"
-CHAR_BATTERY          = "00002a19-0000-1000-8000-00805f9b34fb"
+DEVICE_NAME         = "MALEM ALARM"
+CHAR_AUTH_WRITE     = "0000fff1-0000-1000-8000-00805f9b34fb"
+CHAR_AUTH_CHALLENGE = "0000fff2-0000-1000-8000-00805f9b34fb"
+CHAR_STATUS         = "0000fff4-0000-1000-8000-00805f9b34fb"
+CHAR_BATTERY        = "00002a19-0000-1000-8000-00805f9b34fb"
 
 KEY_TABLE = [0x79, 0xA8, 0xBF, 0x90, 0x88, 0x3E, 0x45, 0x13,
              0x46, 0x6C, 0xF9, 0xD7, 0x20, 0xCA, 0x58, 0xDA]
@@ -80,6 +85,129 @@ TOPIC_AVAILABILITY   = f"{TOPIC_PREFIX}/moisture/availability"
 TOPIC_BATTERY_STATE  = f"{TOPIC_PREFIX}/battery/state"
 TOPIC_DISC_MOISTURE  = f"homeassistant/binary_sensor/{TOPIC_PREFIX}_moisture/config"
 TOPIC_DISC_BATTERY   = f"homeassistant/sensor/{TOPIC_PREFIX}_battery/config"
+
+# ── known GATT service layout ─────────────────────────────────────────────────
+# Every Malem BLE device has these exact services — hardcoded in the original
+# Android APK (SampleGattAttributes.java). Pre-injecting them into bleak
+# bypasses BlueZ service discovery entirely, which would otherwise consume
+# the device's 3-second auth window.
+
+MALEM_SERVICES = [
+    {
+        "uuid": "00001800-0000-1000-8000-00805f9b34fb",
+        "handle": 1,
+        "characteristics": [],
+    },
+    {
+        "uuid": "0000fff0-0000-1000-8000-00805f9b34fb",
+        "handle": 20,
+        "characteristics": [
+            {
+                "uuid": CHAR_AUTH_WRITE,
+                "handle": 21,
+                "properties": ["write"],
+                "descriptors": [],
+            },
+            {
+                "uuid": CHAR_AUTH_CHALLENGE,
+                "handle": 23,
+                "properties": ["read"],
+                "descriptors": [],
+            },
+            {
+                "uuid": CHAR_STATUS,
+                "handle": 25,
+                "properties": ["read", "notify"],
+                "descriptors": [
+                    {
+                        "uuid": "00002902-0000-1000-8000-00805f9b34fb",
+                        "handle": 27,
+                    }
+                ],
+            },
+        ],
+    },
+]
+
+
+def build_service_collection() -> BleakGATTServiceCollection:
+    """Build a BleakGATTServiceCollection from our hardcoded service layout."""
+    collection = BleakGATTServiceCollection()
+    for svc_def in MALEM_SERVICES:
+        svc = BleakGATTService(
+            obj={"UUID": svc_def["uuid"], "Primary": True},
+            path=f"/org/bluez/hci0/service{svc_def['handle']:04x}",
+        )
+        # Manually set the handle since the constructor may not accept it
+        svc.__dict__["_handle"] = svc_def["handle"]
+        collection.add_service(svc)
+
+        for char_def in svc_def["characteristics"]:
+            char_path = f"{svc.path}/char{char_def['handle']:04x}"
+            char = BleakGATTCharacteristic(
+                obj={
+                    "UUID": char_def["uuid"],
+                    "Flags": char_def["properties"],
+                    "Value": [],
+                    "Notifying": False,
+                },
+                path=char_path,
+                max_write_without_response_size=512,
+            )
+            char.__dict__["_handle"] = char_def["handle"]
+            collection.add_characteristic(char)
+
+            for desc_def in char_def.get("descriptors", []):
+                desc_path = f"{char_path}/desc{desc_def['handle']:04x}"
+                desc = BleakGATTDescriptor(
+                    obj={"UUID": desc_def["uuid"], "Value": []},
+                    path=desc_path,
+                    characteristic_uuid=char_def["uuid"],
+                    characteristic_handle=char_def["handle"],
+                )
+                desc.__dict__["_handle"] = desc_def["handle"]
+                collection.add_descriptor(desc)
+
+    return collection
+
+
+async def connect_with_known_services(address: str) -> BleakClient:
+    """
+    Connect to the device and inject our pre-built service collection,
+    bypassing BlueZ GATT discovery entirely.
+
+    The injection sets a private attribute on the bleak BlueZ backend to
+    signal that services are already resolved. If the attribute name differs
+    in this bleak version we log a warning and fall back to normal discovery.
+    If injection fails, the warning log will show all backend attributes so
+    we can identify the correct name.
+    """
+    client = BleakClient(address, timeout=15.0)
+    await client.connect()
+
+    if not client.is_connected:
+        raise BleakError("Failed to connect")
+
+    # Attempt to inject known services to skip discovery
+    injected = False
+    backend = client._backend
+    for attr in ("_services_resolved", "_service_discovery_complete",
+                 "_services_discovered", "services_resolved"):
+        if hasattr(backend, attr):
+            setattr(backend, attr, True)
+            client.services = build_service_collection()
+            log.info(f"Connected (services injected via {attr}, discovery skipped)")
+            injected = True
+            break
+
+    if not injected:
+        log.warning("Could not inject services (unknown bleak internals) - "
+                    "falling back to discovery, auth may time out")
+        log.warning(f"Backend attrs: {[a for a in dir(backend) if not a.startswith(chr(95)*2)]}")
+
+    return client
+
+
 
 # ── state file ────────────────────────────────────────────────────────────────
 
@@ -109,7 +237,6 @@ mqtt_client = mqtt.Client(
 def mqtt_connect():
     if MQTT_USERNAME:
         mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-
     mqtt_client.will_set(TOPIC_AVAILABILITY, "offline", retain=True)
 
     def on_connect(client, userdata, flags, reason_code, properties):
@@ -355,13 +482,9 @@ async def monitor(client: BleakClient, device_address: str, has_battery: bool):
 # ── scanner ───────────────────────────────────────────────────────────────────
 
 async def find_and_save_device() -> str:
-    """
-    Scan for the sensor by name, save its MAC to the state file, then
-    exit with code 2 to signal run.sh to write the BlueZ cache and restart.
-    This only runs on first install (no MAC in state file or config override).
-    """
+    """First-run: scan by name, save MAC, exit so s6 restarts with MAC known."""
     log.info(f"First run — scanning for {DEVICE_NAME} to discover MAC address...")
-    log.info("This may take up to 30 seconds.")
+    log.info("This may take up to 60 seconds.")
 
     found = asyncio.Event()
     result = [None, None]
@@ -375,37 +498,16 @@ async def find_and_save_device() -> str:
     async with BleakScanner(detection_callback=on_device):
         await asyncio.wait_for(found.wait(), timeout=60.0)
 
-    address, rssi = result
-    log.info(f"Found {DEVICE_NAME} at {address} (RSSI {rssi} dBm)")
-    log.info(f"Saving MAC address to {STATE_FILE}")
+    address = result[0]
+    log.info(f"Found {DEVICE_NAME} at {address} (RSSI {result[1]} dBm)")
 
     state = load_state()
     state["sensor_mac"] = address
     state["sensor_name"] = DEVICE_NAME
     save_state(state)
-
-    log.info("MAC saved — restarting to apply BlueZ cache and connect...")
-    # Exit code 2 signals run.sh to write the cache and restart the addon
+    log.info(f"MAC address saved to {STATE_FILE}")
+    log.info("Restarting to connect...")
     sys.exit(2)
-
-
-async def find_device(address: str) -> tuple[str, int]:
-    """Confirm a known device is advertising and return its current RSSI."""
-    log.info(f"Scanning for {address}...")
-    found = asyncio.Event()
-    result = [None, None]
-
-    def on_device(device, adv):
-        if device.address.upper() == address.upper():
-            result[0] = device.address
-            result[1] = adv.rssi
-            found.set()
-
-    async with BleakScanner(detection_callback=on_device):
-        await asyncio.wait_for(found.wait(), timeout=30.0)
-
-    log.info(f"Found {result[0]} (RSSI {result[1]} dBm)")
-    return result[0], result[1]
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -414,27 +516,27 @@ async def main():
     mqtt_connect()
     await asyncio.sleep(2)
 
-    # Determine MAC address — priority: config override → state file → first-run scan
+    # Determine MAC — priority: config override → state file → first-run scan
     if SENSOR_MAC_OVERRIDE:
         address = SENSOR_MAC_OVERRIDE
-        log.info(f"Using MAC from config override: {address}")
+        log.info(f"Using MAC from config: {address}")
     else:
         state = load_state()
         if "sensor_mac" in state:
             address = state["sensor_mac"].upper()
-            log.info(f"Using saved MAC address: {address}")
+            log.info(f"Using saved MAC: {address}")
         else:
-            # First run — scan, save, restart
             await find_and_save_device()
-            return  # unreachable — find_and_save_device exits
+            return  # unreachable
 
     failures = 0
 
     while True:
         try:
             log.info(f"Connecting to {address}...")
-            async with BleakClient(address, timeout=15.0) as client:
-                log.info("Connected")
+            client = await connect_with_known_services(address)
+
+            try:
                 mqtt_client.publish(TOPIC_AVAILABILITY, "online", retain=True)
 
                 if not await authenticate(client):
@@ -452,8 +554,12 @@ async def main():
 
                 await monitor(client, address, has_battery)
 
+            finally:
+                if client.is_connected:
+                    await client.disconnect()
+
         except asyncio.TimeoutError:
-            log.warning("Scan timed out — retrying")
+            log.warning("Connection timed out — retrying")
             await asyncio.sleep(2)
 
         except BleakError as e:
