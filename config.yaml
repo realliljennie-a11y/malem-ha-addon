@@ -1,6 +1,6 @@
 name: "Malem Alarm"
 description: "BLE moisture sensor listener for Malem bedwetting alarms"
-version: "1.0.0"
+version: "1.1.0"
 slug: "malem_alarm"
 init: false
 arch:
@@ -8,16 +8,13 @@ arch:
   - amd64
   - armv7
 
-# Bluetooth requires host D-Bus to reach BlueZ
 host_dbus: true
 
-# NET_ADMIN for BLE scanning, NET_RAW + SYS_ADMIN for full BT stack access
 privileged:
   - NET_ADMIN
   - NET_RAW
   - SYS_ADMIN
 
-# BT is accessed via D-Bus/BlueZ, not a device file
 devices: []
 uart: false
 usb: false
@@ -25,7 +22,6 @@ usb: false
 map:
   - config:rw
 
-# Add-on options (editable in HA UI)
 options:
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
@@ -34,6 +30,7 @@ options:
   mqtt_topic_prefix: "malem"
   dry_timeout: 15
   log_level: "info"
+  sensor_mac: ""
 
 schema:
   mqtt_host: str
@@ -43,5 +40,6 @@ schema:
   mqtt_topic_prefix: str
   dry_timeout: int
   log_level: list(debug|info|warning|error)
+  sensor_mac: str
 
 url: "https://github.com/realliljennie-a11y/malem-ha-addon"
