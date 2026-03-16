@@ -24,7 +24,8 @@ A Home Assistant add-on that integrates the **Malem wireless bedwetting alarm** 
 | `mqtt_port` | `1883` | MQTT broker port |
 | `mqtt_username` | _(empty)_ | MQTT username |
 | `mqtt_password` | _(empty)_ | MQTT password |
-| `mqtt_topic_prefix` | `malem` | Topic prefix (change if running multiple sensors) |
+| `mqtt_topic_prefix` | `malem` | Topic prefix (change to customize or if running multiple sensors) |
+| `sensor_mac` | _(empty)_ | MAC address of sensor device (autofilled after first attempt but change to override) |
 | `dry_timeout` | `15` | Seconds to wait before declaring dry if 0xAC is missed |
 | `log_level` | `info` | Logging verbosity: debug / info / warning / error |
 
