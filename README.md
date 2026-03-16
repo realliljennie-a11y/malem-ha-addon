@@ -11,7 +11,7 @@ A Home Assistant add-on that integrates the **Malem wireless bedwetting alarm** 
 ## Installation
 
 1. In HA: **Settings → Add-ons → ⋮ → Repositories**
-2. Add: `https://github.com/YOUR_GITHUB_USERNAME/malem-ha-addon`
+2. Add: `https://github.com/realliljennie-a11y/malem-ha-addon`
 3. Install **Malem Alarm** from the add-on store
 4. Configure MQTT credentials in the **Configuration** tab
 5. Start the add-on
