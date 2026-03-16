@@ -4,12 +4,14 @@ Listens for Malem BLE moisture sensor events and publishes to MQTT
 with Home Assistant MQTT discovery, so the sensor auto-appears in HA.
 
 MQTT topics published:
-  {prefix}/sensor/state          "wet" | "dry"
-  {prefix}/sensor/attributes     JSON: last_wet_duration, last_wet_time, rssi
-  {prefix}/sensor/availability   "online" | "offline"
+  {prefix}/moisture/state          "wet" | "dry"
+  {prefix}/moisture/attributes     JSON: last_wet_duration, last_wet_time
+  {prefix}/moisture/availability   "online" | "offline"
+  {prefix}/battery/state           0-100 (if supported by device)
 
-HA discovery topic:
-  homeassistant/binary_sensor/{prefix}/config
+HA discovery topics:
+  homeassistant/binary_sensor/{prefix}_moisture/config
+  homeassistant/sensor/{prefix}_battery/config   (if battery found)
 """
 
 import asyncio
@@ -21,18 +23,19 @@ import time
 from datetime import datetime
 
 import paho.mqtt.client as mqtt
+from paho.mqtt.enums import CallbackAPIVersion
 from bleak import BleakScanner, BleakClient
 from bleak.exc import BleakError
 
-# ── config from environment (set by run.sh from HA options) ──────────────────
+# ── config ────────────────────────────────────────────────────────────────────
 
-MQTT_HOST         = os.environ.get("MQTT_HOST", "core-mosquitto")
-MQTT_PORT         = int(os.environ.get("MQTT_PORT", 1883))
-MQTT_USERNAME     = os.environ.get("MQTT_USERNAME", "")
-MQTT_PASSWORD     = os.environ.get("MQTT_PASSWORD", "")
-TOPIC_PREFIX      = os.environ.get("MQTT_TOPIC_PREFIX", "malem")
-DRY_TIMEOUT       = int(os.environ.get("DRY_TIMEOUT", 15))
-LOG_LEVEL         = os.environ.get("LOG_LEVEL", "info").upper()
+MQTT_HOST     = os.environ.get("MQTT_HOST", "core-mosquitto")
+MQTT_PORT     = int(os.environ.get("MQTT_PORT", 1883))
+MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "")
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "")
+TOPIC_PREFIX  = os.environ.get("MQTT_TOPIC_PREFIX", "malem")
+DRY_TIMEOUT   = int(os.environ.get("DRY_TIMEOUT", 15))
+LOG_LEVEL     = os.environ.get("LOG_LEVEL", "info").upper()
 
 # ── logging ───────────────────────────────────────────────────────────────────
 
@@ -49,40 +52,46 @@ DEVICE_NAME         = "MALEM ALARM"
 CHAR_AUTH_WRITE     = "0000fff1-0000-1000-8000-00805f9b34fb"
 CHAR_AUTH_CHALLENGE = "0000fff2-0000-1000-8000-00805f9b34fb"
 CHAR_STATUS         = "0000fff4-0000-1000-8000-00805f9b34fb"
+CHAR_BATTERY        = "00002a19-0000-1000-8000-00805f9b34fb"  # standard BLE battery
 
 KEY_TABLE = [0x79, 0xA8, 0xBF, 0x90, 0x88, 0x3E, 0x45, 0x13,
              0x46, 0x6C, 0xF9, 0xD7, 0x20, 0xCA, 0x58, 0xDA]
 
-POLL_INTERVAL = 1.5
+POLL_INTERVAL         = 1.5   # seconds between status polls
+BATTERY_POLL_INTERVAL = 300   # seconds between battery reads (5 min)
 
 # ── MQTT topics ───────────────────────────────────────────────────────────────
 
-TOPIC_STATE        = f"{TOPIC_PREFIX}/sensor/state"
-TOPIC_ATTRIBUTES   = f"{TOPIC_PREFIX}/sensor/attributes"
-TOPIC_AVAILABILITY = f"{TOPIC_PREFIX}/sensor/availability"
-TOPIC_DISCOVERY    = f"homeassistant/binary_sensor/{TOPIC_PREFIX}/config"
+TOPIC_MOISTURE_STATE  = f"{TOPIC_PREFIX}/moisture/state"
+TOPIC_MOISTURE_ATTRS  = f"{TOPIC_PREFIX}/moisture/attributes"
+TOPIC_AVAILABILITY    = f"{TOPIC_PREFIX}/moisture/availability"
+TOPIC_BATTERY_STATE   = f"{TOPIC_PREFIX}/battery/state"
+TOPIC_DISC_MOISTURE   = f"homeassistant/binary_sensor/{TOPIC_PREFIX}_moisture/config"
+TOPIC_DISC_BATTERY    = f"homeassistant/sensor/{TOPIC_PREFIX}_battery/config"
 
-# ── MQTT client ───────────────────────────────────────────────────────────────
+# ── MQTT ──────────────────────────────────────────────────────────────────────
 
-mqtt_client = mqtt.Client(client_id=f"malem_addon")
+mqtt_client = mqtt.Client(
+    callback_api_version=CallbackAPIVersion.VERSION2,
+    client_id="malem_addon",
+)
 
 def mqtt_connect():
     if MQTT_USERNAME:
         mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
 
-    # Publish "offline" as last will if we disconnect unexpectedly
     mqtt_client.will_set(TOPIC_AVAILABILITY, "offline", retain=True)
 
-    def on_connect(client, userdata, flags, rc):
-        if rc == 0:
+    def on_connect(client, userdata, flags, reason_code, properties):
+        if reason_code == 0:
             log.info(f"MQTT connected to {MQTT_HOST}:{MQTT_PORT}")
-            publish_discovery()
+            publish_discovery_moisture()
             client.publish(TOPIC_AVAILABILITY, "online", retain=True)
         else:
-            log.error(f"MQTT connection failed: rc={rc}")
+            log.error(f"MQTT connection failed: {reason_code}")
 
-    def on_disconnect(client, userdata, rc):
-        if rc != 0:
+    def on_disconnect(client, userdata, flags, reason_code, properties):
+        if reason_code != 0:
             log.warning("MQTT disconnected unexpectedly, will retry")
 
     mqtt_client.on_connect = on_connect
@@ -91,22 +100,18 @@ def mqtt_connect():
     mqtt_client.loop_start()
 
 
-def publish_discovery():
-    """
-    Publish HA MQTT discovery config so the sensor auto-appears in HA
-    as a binary moisture sensor with availability tracking.
-    """
+def publish_discovery_moisture():
     payload = {
-        "name": "Malem Moisture Sensor",
+        "name": "Malem Moisture",
         "unique_id": f"{TOPIC_PREFIX}_moisture",
         "device_class": "moisture",
-        "state_topic": TOPIC_STATE,
+        "state_topic": TOPIC_MOISTURE_STATE,
         "payload_on": "wet",
         "payload_off": "dry",
         "availability_topic": TOPIC_AVAILABILITY,
         "payload_available": "online",
         "payload_not_available": "offline",
-        "json_attributes_topic": TOPIC_ATTRIBUTES,
+        "json_attributes_topic": TOPIC_MOISTURE_ATTRS,
         "device": {
             "identifiers": [TOPIC_PREFIX],
             "name": "Malem Alarm",
@@ -115,15 +120,42 @@ def publish_discovery():
         },
         "icon": "mdi:water-alert",
     }
-    mqtt_client.publish(TOPIC_DISCOVERY, json.dumps(payload), retain=True)
-    log.info("Published MQTT discovery config")
+    mqtt_client.publish(TOPIC_DISC_MOISTURE, json.dumps(payload), retain=True)
+    log.info("Published moisture discovery config")
 
 
-def publish_state(state: str, attributes: dict = None):
-    mqtt_client.publish(TOPIC_STATE, state, retain=True)
+def publish_discovery_battery():
+    payload = {
+        "name": "Malem Battery",
+        "unique_id": f"{TOPIC_PREFIX}_battery",
+        "device_class": "battery",
+        "state_topic": TOPIC_BATTERY_STATE,
+        "unit_of_measurement": "%",
+        "availability_topic": TOPIC_AVAILABILITY,
+        "payload_available": "online",
+        "payload_not_available": "offline",
+        "device": {
+            "identifiers": [TOPIC_PREFIX],
+            "name": "Malem Alarm",
+            "model": "Malem BLE Moisture Sensor",
+            "manufacturer": "Malem",
+        },
+        "icon": "mdi:battery",
+    }
+    mqtt_client.publish(TOPIC_DISC_BATTERY, json.dumps(payload), retain=True)
+    log.info("Published battery discovery config")
+
+
+def publish_moisture(state: str, attributes: dict = None):
+    mqtt_client.publish(TOPIC_MOISTURE_STATE, state, retain=True)
     if attributes:
-        mqtt_client.publish(TOPIC_ATTRIBUTES, json.dumps(attributes), retain=True)
-    log.info(f"State → {state}" + (f"  attrs={attributes}" if attributes else ""))
+        mqtt_client.publish(TOPIC_MOISTURE_ATTRS, json.dumps(attributes), retain=True)
+    log.info(f"Moisture → {state}" + (f"  {attributes}" if attributes else ""))
+
+
+def publish_battery(level: int):
+    mqtt_client.publish(TOPIC_BATTERY_STATE, str(level), retain=True)
+    log.info(f"Battery → {level}%")
 
 
 # ── auth ──────────────────────────────────────────────────────────────────────
@@ -175,6 +207,7 @@ def generate_auth_response(tempid: int) -> bytes:
 
 
 async def authenticate(client: BleakClient) -> bool:
+    """Complete challenge-response. Must finish within ~3s of connect."""
     try:
         t0 = time.monotonic()
         challenge = await client.read_gatt_char(CHAR_AUTH_CHALLENGE)
@@ -188,12 +221,31 @@ async def authenticate(client: BleakClient) -> bool:
         return False
 
 
+# ── battery ───────────────────────────────────────────────────────────────────
+
+async def read_battery(client: BleakClient) -> int | None:
+    """
+    Attempt to read the standard BLE Battery Level characteristic (0x2A19).
+    Returns 0-100 if present, None if the device doesn't support it.
+    Only called once after auth, then periodically during monitoring.
+    """
+    try:
+        data = await client.read_gatt_char(CHAR_BATTERY)
+        level = data[0] & 0xFF
+        log.info(f"Battery level: {level}%")
+        return level
+    except BleakError:
+        log.info("Battery characteristic not available on this device")
+        return None
+
+
 # ── monitor ───────────────────────────────────────────────────────────────────
 
-async def monitor(client: BleakClient, device_address: str):
+async def monitor(client: BleakClient, device_address: str, has_battery: bool):
     wet = False
     wet_start = None
     last_ab = None
+    last_battery_read = time.monotonic()
 
     pending = []
     def on_notify(sender, data):
@@ -202,7 +254,7 @@ async def monitor(client: BleakClient, device_address: str):
     await client.start_notify(CHAR_STATUS, on_notify)
     await asyncio.sleep(0.3)
 
-    publish_state("dry", {"sensor_address": device_address, "status": "monitoring"})
+    publish_moisture("dry", {"sensor_address": device_address, "status": "monitoring"})
 
     while client.is_connected:
         try:
@@ -211,6 +263,7 @@ async def monitor(client: BleakClient, device_address: str):
             log.error(f"Poll error: {e}")
             break
 
+        # Process notifications first, then polled value if it differs
         to_process = []
         while pending:
             to_process.append(pending.pop(0))
@@ -228,7 +281,7 @@ async def monitor(client: BleakClient, device_address: str):
                     wet_start = time.monotonic()
                     last_ab = None
                     log.info("Wet event started")
-                    publish_state("wet", {
+                    publish_moisture("wet", {
                         "sensor_address": device_address,
                         "wet_since": datetime.now().isoformat(),
                         "status": "wet",
@@ -242,11 +295,10 @@ async def monitor(client: BleakClient, device_address: str):
                 if wet:
                     raw = data[1] & 0xFF if len(data) > 1 else 0
                     device_secs = 1 if raw == 0 else min(raw * 5, 600)
-                    local_secs = int(time.monotonic() - wet_start)
                     wet = False
                     pending.clear()
                     log.info(f"Dry — duration {device_secs}s")
-                    publish_state("dry", {
+                    publish_moisture("dry", {
                         "sensor_address": device_address,
                         "last_wet_duration": device_secs,
                         "last_wet_time": datetime.now().isoformat(),
@@ -259,12 +311,19 @@ async def monitor(client: BleakClient, device_address: str):
                 local_secs = int(time.monotonic() - wet_start)
                 wet = False
                 log.warning(f"Dry (timeout fallback) — local duration {local_secs}s")
-                publish_state("dry", {
+                publish_moisture("dry", {
                     "sensor_address": device_address,
                     "last_wet_duration": local_secs,
                     "last_wet_time": datetime.now().isoformat(),
                     "status": "dry (timeout)",
                 })
+
+        # Periodic battery read
+        if has_battery and time.monotonic() - last_battery_read > BATTERY_POLL_INTERVAL:
+            level = await read_battery(client)
+            if level is not None:
+                publish_battery(level)
+            last_battery_read = time.monotonic()
 
         await asyncio.sleep(POLL_INTERVAL)
 
@@ -275,7 +334,6 @@ async def monitor(client: BleakClient, device_address: str):
 # ── scanner ───────────────────────────────────────────────────────────────────
 
 async def find_device() -> tuple[str, int]:
-    """Returns (address, rssi)."""
     log.info(f"Scanning for {DEVICE_NAME}...")
     found = asyncio.Event()
     result = [None, None]
@@ -297,11 +355,9 @@ async def find_device() -> tuple[str, int]:
 
 async def main():
     mqtt_connect()
-    # Give MQTT a moment to connect before we start publishing
     await asyncio.sleep(2)
 
     address = None
-    rssi = None
     failures = 0
 
     while True:
@@ -320,7 +376,15 @@ async def main():
                     continue
 
                 failures = 0
-                await monitor(client, address)
+
+                # Probe for battery once after auth
+                battery = await read_battery(client)
+                has_battery = battery is not None
+                if has_battery:
+                    publish_discovery_battery()
+                    publish_battery(battery)
+
+                await monitor(client, address, has_battery)
 
         except asyncio.TimeoutError:
             log.warning("Scan timed out — rescanning")
