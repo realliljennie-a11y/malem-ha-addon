@@ -7,11 +7,12 @@ On first run the add-on scans for the sensor by name and saves its MAC
 address to /config/malem_state.json. On all subsequent runs the MAC is
 loaded from that file — no manual configuration required.
 
-Service discovery is bypassed entirely by pre-populating the bleak GATT
-service collection with the known Malem service layout. This is safe
-because every Malem BLE device has identical services (hardcoded in the
-original Android app). This avoids the ~2s BlueZ discovery window that
-causes the device to drop the connection before auth completes.
+Service discovery is bypassed entirely by monkey-patching the bleak BlueZ
+backend's _get_services() method to return an empty collection immediately.
+All GATT operations use UUID strings (not handle numbers), so this is safe —
+bleak resolves UUIDs to handles lazily on first use via D-Bus, which is fast
+because it only looks up the specific characteristic needed rather than
+enumerating all services.
 
 MQTT topics published:
   {prefix}/moisture/state          "wet" | "dry"
@@ -36,9 +37,7 @@ from datetime import datetime
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 from bleak import BleakScanner, BleakClient
-from bleak.backends.characteristic import BleakGATTCharacteristic
-from bleak.backends.descriptor import BleakGATTDescriptor
-from bleak.backends.service import BleakGATTService, BleakGATTServiceCollection
+from bleak.backends.service import BleakGATTServiceCollection
 from bleak.exc import BleakError
 
 # ── config ────────────────────────────────────────────────────────────────────
@@ -86,125 +85,48 @@ TOPIC_BATTERY_STATE  = f"{TOPIC_PREFIX}/battery/state"
 TOPIC_DISC_MOISTURE  = f"homeassistant/binary_sensor/{TOPIC_PREFIX}_moisture/config"
 TOPIC_DISC_BATTERY   = f"homeassistant/sensor/{TOPIC_PREFIX}_battery/config"
 
-# ── known GATT service layout ─────────────────────────────────────────────────
-# Every Malem BLE device has these exact services — hardcoded in the original
-# Android APK (SampleGattAttributes.java). Pre-injecting them into bleak
-# bypasses BlueZ service discovery entirely, which would otherwise consume
-# the device's 3-second auth window.
-
-MALEM_SERVICES = [
-    {
-        "uuid": "00001800-0000-1000-8000-00805f9b34fb",
-        "handle": 1,
-        "characteristics": [],
-    },
-    {
-        "uuid": "0000fff0-0000-1000-8000-00805f9b34fb",
-        "handle": 20,
-        "characteristics": [
-            {
-                "uuid": CHAR_AUTH_WRITE,
-                "handle": 21,
-                "properties": ["write"],
-                "descriptors": [],
-            },
-            {
-                "uuid": CHAR_AUTH_CHALLENGE,
-                "handle": 23,
-                "properties": ["read"],
-                "descriptors": [],
-            },
-            {
-                "uuid": CHAR_STATUS,
-                "handle": 25,
-                "properties": ["read", "notify"],
-                "descriptors": [
-                    {
-                        "uuid": "00002902-0000-1000-8000-00805f9b34fb",
-                        "handle": 27,
-                    }
-                ],
-            },
-        ],
-    },
-]
-
-
-def build_service_collection() -> BleakGATTServiceCollection:
-    """Build a BleakGATTServiceCollection from our hardcoded service layout."""
-    collection = BleakGATTServiceCollection()
-    for svc_def in MALEM_SERVICES:
-        svc = BleakGATTService(
-            obj={"UUID": svc_def["uuid"], "Primary": True},
-            path=f"/org/bluez/hci0/service{svc_def['handle']:04x}",
-        )
-        # Manually set the handle since the constructor may not accept it
-        svc.__dict__["_handle"] = svc_def["handle"]
-        collection.add_service(svc)
-
-        for char_def in svc_def["characteristics"]:
-            char_path = f"{svc.path}/char{char_def['handle']:04x}"
-            char = BleakGATTCharacteristic(
-                obj={
-                    "UUID": char_def["uuid"],
-                    "Flags": char_def["properties"],
-                    "Value": [],
-                    "Notifying": False,
-                },
-                path=char_path,
-                max_write_without_response_size=512,
-            )
-            char.__dict__["_handle"] = char_def["handle"]
-            collection.add_characteristic(char)
-
-            for desc_def in char_def.get("descriptors", []):
-                desc_path = f"{char_path}/desc{desc_def['handle']:04x}"
-                desc = BleakGATTDescriptor(
-                    obj={"UUID": desc_def["uuid"], "Value": []},
-                    path=desc_path,
-                    characteristic_uuid=char_def["uuid"],
-                    characteristic_handle=char_def["handle"],
-                )
-                desc.__dict__["_handle"] = desc_def["handle"]
-                collection.add_descriptor(desc)
-
-    return collection
-
+# ── BLE connection ────────────────────────────────────────────────────────────
 
 async def connect_with_known_services(address: str) -> BleakClient:
     """
-    Connect to the device and inject our pre-built service collection,
-    bypassing BlueZ GATT discovery entirely.
+    Connect to the device bypassing both the pre-connect scan and GATT
+    service discovery.
 
-    The injection sets a private attribute on the bleak BlueZ backend to
-    signal that services are already resolved. If the attribute name differs
-    in this bleak version we log a warning and fall back to normal discovery.
-    If injection fails, the warning log will show all backend attributes so
-    we can identify the correct name.
+    Two things in bleak's connect() normally consume the Malem device's
+    3-second auth window:
+
+    1. BleakScanner.find_device_by_address() — a scan that runs if
+       _device_path is not already set.
+    2. _get_services() — waits for BlueZ ServicesResolved signal.
+
+    We bypass both:
+    - Pre-set _device_path from the known MAC address so the scan is skipped.
+    - Pre-set client.services to an empty collection. _get_services() checks
+      "if self.services is not None: return self.services" at the top, so it
+      returns immediately without querying BlueZ at all.
+
+    All GATT operations use UUID strings; bleak resolves these to D-Bus object
+    paths lazily on first use, which is fast (one object lookup, not a full
+    service tree enumeration).
     """
+    mac_nodash = address.upper().replace(":", "_")
+    device_path = f"/org/bluez/hci0/dev_{mac_nodash}"
+
     client = BleakClient(address, timeout=15.0)
+
+    # Skip pre-connect scan
+    client._backend._device_path = device_path
+    log.debug(f"Pre-set device path: {device_path}")
+
+    # Skip service discovery — _get_services returns immediately if services is set
+    client._backend.services = BleakGATTServiceCollection()
+
     await client.connect()
 
     if not client.is_connected:
         raise BleakError("Failed to connect")
 
-    # Attempt to inject known services to skip discovery
-    injected = False
-    backend = client._backend
-    for attr in ("_services_resolved", "_service_discovery_complete",
-                 "_services_discovered", "services_resolved"):
-        if hasattr(backend, attr):
-            setattr(backend, attr, True)
-            client.services = build_service_collection()
-            log.info(f"Connected (services injected via {attr}, discovery skipped)")
-            injected = True
-            break
-
-    if not injected:
-        log.warning("Could not inject services (unknown bleak internals) - "
-                    "falling back to discovery, auth may time out")
-        log.warning(f"Backend attrs: {[a for a in dir(backend) if not a.startswith(chr(95)*2)]}")
-
+    log.info("Connected (scan + GATT discovery bypassed)")
     return client
 
 
