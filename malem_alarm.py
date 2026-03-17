@@ -269,8 +269,8 @@ async def connect_and_auth(address: str) -> BleakClient:
     client.connect() blocks until BlueZ service discovery completes (3-8s).
     The Malem device drops the connection after ~3s without auth.
     So we run connect() as a background task, poll until the BLE link is
-    established (~0.2s), immediately auth via D-Bus (~0.1s), then let
-    discovery finish in the background.
+    established, wait for BlueZ to register GATT objects, auth immediately,
+    then let discovery finish in the background.
     """
     ble_device = await scan_for_device(address)
     log.info(f"Connecting to {address}...")
@@ -282,44 +282,76 @@ async def connect_and_auth(address: str) -> BleakClient:
         client.connect(dangerous_use_bleak_cache=True)
     )
 
-    # Poll until BLE link is up (happens well before discovery completes)
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        await asyncio.sleep(0.05)
-        if client._backend._is_connected:
-            break
-    else:
-        connect_task.cancel()
-        try:
-            await asyncio.shield(connect_task)
-        except Exception:
-            pass
-        raise BleakError("Timed out waiting for BLE connection")
+    auth_ok = False
+    try:
+        # Poll until BLE link is up (happens well before discovery completes)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+            if client._backend._is_connected:
+                break
+        else:
+            raise BleakError("Timed out waiting for BLE connection")
 
-    log.info("Connected — authenticating before service discovery completes...")
+        log.info("Connected — waiting for GATT objects then authenticating...")
 
-    # Give BlueZ a moment to register the GATT characteristic objects in D-Bus.
-    # The BLE link is up but the service0028/char* objects may not exist yet.
-    # 0.5s is enough; auth window is 3s so we have plenty of margin.
-    await asyncio.sleep(0.5)
+        # Poll until the auth characteristic D-Bus object exists.
+        # BlueZ registers GATT objects shortly after connection — we wait
+        # up to 2.5s, which leaves 0.5s margin within the 3s auth window.
+        paths = dbus_paths(address)
+        from dbus_fast.message import Message
+        from bleak.backends.bluezdbus import defs
 
-    if not await auth_via_dbus(client, address):
-        connect_task.cancel()
-        try:
-            await asyncio.shield(connect_task)
-        except Exception:
-            pass
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        raise BleakError("Authentication failed")
+        challenge_ready = False
+        gatt_deadline = time.monotonic() + 2.5
+        while time.monotonic() < gatt_deadline:
+            await asyncio.sleep(0.1)
+            try:
+                bus = client._backend._bus
+                if bus is None:
+                    continue
+                reply = await bus.call(Message(
+                    destination=defs.BLUEZ_SERVICE,
+                    path=paths["auth_challenge"],
+                    interface="org.freedesktop.DBus.Properties",
+                    member="Get",
+                    signature="ss",
+                    body=[defs.GATT_CHARACTERISTIC_INTERFACE, "UUID"],
+                ))
+                if reply.message_type.name != "ERROR":
+                    challenge_ready = True
+                    break
+            except Exception:
+                pass
+
+        if not challenge_ready:
+            raise BleakError("GATT objects not available within auth window")
+
+        log.info(f"GATT objects ready at {time.monotonic() - (gatt_deadline - 2.5):.2f}s")
+
+        auth_ok = await auth_via_dbus(client, address)
+
+    finally:
+        if not auth_ok:
+            # Don't cancel connect_task — let it finish so BlueZ cleans up properly
+            # Just wait briefly for it
+            try:
+                await asyncio.wait_for(asyncio.shield(connect_task), timeout=5.0)
+            except Exception:
+                pass
+            try:
+                if client.is_connected:
+                    await client.disconnect()
+            except Exception:
+                pass
+            if not auth_ok:
+                raise BleakError("Authentication failed")
 
     # Wait for connect task (service discovery) to finish
     try:
         await asyncio.wait_for(asyncio.shield(connect_task), timeout=12.0)
     except (asyncio.TimeoutError, BleakError, asyncio.CancelledError) as e:
-        log.warning(f"Service discovery in connect task: {type(e).__name__} — will wait separately")
+        log.warning(f"Service discovery: {type(e).__name__} — will wait separately")
 
     return client
 
