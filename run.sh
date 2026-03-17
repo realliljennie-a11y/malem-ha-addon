@@ -27,7 +27,9 @@ if [ -n "$SENSOR_MAC_RESOLVED" ]; then
         bluetoothctl --timeout 5 scan on 2>/dev/null || true
         if bluetoothctl connect "$SENSOR_MAC_RESOLVED" 2>&1 | grep -q "Connection successful"; then
             CONNECTED=1
-            bashio::log.info "Connected — handing off to Python"
+            bashio::log.info "Connected — waiting for GATT objects..."
+            sleep 2
+            bashio::log.info "Handing off to Python"
         else
             bashio::log.info "Device not ready — retrying in 5s"
             sleep 5
