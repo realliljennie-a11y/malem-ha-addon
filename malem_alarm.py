@@ -231,6 +231,26 @@ async def remove_device(address: str):
         log.debug(f"Remove device (non-fatal): {e}")
 
 
+async def reset_adapter():
+    """
+    Power-cycle the Bluetooth adapter to flush stuck connection state.
+    Equivalent to hciconfig hci0 reset — resets firmware without unloading driver.
+    Called after repeated discovery failures when remove_device alone isn't enough.
+    """
+    import subprocess
+    try:
+        log.warning("Resetting Bluetooth adapter...")
+        subprocess.run(["btmgmt", "power", "off"], capture_output=True, timeout=5)
+        await asyncio.sleep(2)
+        subprocess.run(["btmgmt", "power", "on"], capture_output=True, timeout=5)
+        await asyncio.sleep(3)
+        log.warning("Bluetooth adapter reset complete")
+        return True
+    except Exception as e:
+        log.error(f"Adapter reset failed: {e}")
+        return False
+
+
 async def scan_for_device(address: str):
     """Scan until device is seen, returning BLEDevice with correct D-Bus path."""
     log.info(f"Scanning for {address}...")
@@ -550,6 +570,7 @@ async def main():
 
     disc_failures = 0  # consecutive "failed to discover services" errors
     auth_failures = 0  # consecutive auth failures
+    first_disc_failure_time = None  # when the current discovery failure streak started
 
     while True:
         client = None
@@ -557,6 +578,7 @@ async def main():
             client = await connect_and_auth(address)
             disc_failures = 0
             auth_failures = 0
+            first_disc_failure_time = None
             mqtt_client.publish(TOPIC_AVAILABILITY, "online", retain=True)
 
             if not await wait_for_services(client):
@@ -590,14 +612,20 @@ async def main():
 
             if "failed to discover services" in err:
                 disc_failures += 1
-                # After 3 consecutive discovery failures, remove device and try fresh.
-                # Fewer than 3: retry without removing so BlueZ cache can warm up.
-                if disc_failures % 3 == 0:
-                    log.warning(f"Discovery failure {disc_failures} — removing device for fresh attempt")
+                if first_disc_failure_time is None:
+                    first_disc_failure_time = time.monotonic()
+
+                elapsed = time.monotonic() - first_disc_failure_time
+
+                if elapsed > 20.0:
+                    # Device has been unavailable for a while — remove for clean slate
+                    log.warning(f"Discovery failing for {elapsed:.0f}s — removing device for fresh attempt")
                     await remove_device(address)
+                    first_disc_failure_time = None
+                    disc_failures = 0
                     await asyncio.sleep(5)
                 else:
-                    log.info(f"Discovery failure {disc_failures} — retrying without removing device")
+                    log.info(f"Discovery failure {disc_failures} ({elapsed:.0f}s) — retrying without removing device")
                     await asyncio.sleep(3)
 
             elif "Authentication failed" in err:
