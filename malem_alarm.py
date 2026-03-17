@@ -291,17 +291,22 @@ async def connect_and_auth(address: str) -> BleakClient:
     else:
         connect_task.cancel()
         try:
-            await connect_task
+            await asyncio.shield(connect_task)
         except Exception:
             pass
         raise BleakError("Timed out waiting for BLE connection")
 
     log.info("Connected — authenticating before service discovery completes...")
 
+    # Give BlueZ a moment to register the GATT characteristic objects in D-Bus.
+    # The BLE link is up but the service0028/char* objects may not exist yet.
+    # 0.5s is enough; auth window is 3s so we have plenty of margin.
+    await asyncio.sleep(0.5)
+
     if not await auth_via_dbus(client, address):
         connect_task.cancel()
         try:
-            await asyncio.wait_for(connect_task, timeout=3)
+            await asyncio.shield(connect_task)
         except Exception:
             pass
         try:
@@ -313,8 +318,8 @@ async def connect_and_auth(address: str) -> BleakClient:
     # Wait for connect task (service discovery) to finish
     try:
         await asyncio.wait_for(asyncio.shield(connect_task), timeout=12.0)
-    except (asyncio.TimeoutError, BleakError) as e:
-        log.warning(f"Service discovery in connect task: {e} — will wait separately")
+    except (asyncio.TimeoutError, BleakError, asyncio.CancelledError) as e:
+        log.warning(f"Service discovery in connect task: {type(e).__name__} — will wait separately")
 
     return client
 
