@@ -1,6 +1,6 @@
-# Malem Alarm — Home Assistant Add-on
+# Malem BlueT — Home Assistant Add-on
 
-A Home Assistant add-on that integrates the **Malem Blue-T wireless bedwetting alarm** as a native moisture sensor. The Malem app stopped receiving updates around 2016 and no longer installs on modern Android (I don't know about the iOS version), but the BLE sensor hardware still works perfectly. This add-on reverse-engineers the proprietary BLE protocol to bring it into Home Assistant.
+A Home Assistant add-on that integrates the **Malem BlueT (MO25) wireless bedwetting alarm** as a native moisture sensor. The Malem app stopped receiving updates around 2016 and no longer installs on modern Android (I don't know about the iOS version), but the BLE sensor hardware still works perfectly. This add-on reverse-engineers the proprietary BLE protocol to bring it into Home Assistant.
 
 ## Requirements
 
@@ -12,7 +12,7 @@ A Home Assistant add-on that integrates the **Malem Blue-T wireless bedwetting a
 
 1. In HA: **Settings → Add-ons → ⋮ → Repositories**
 2. Add: `https://github.com/realliljennie-a11y/malem-ha-addon`
-3. Install **Malem Alarm** from the add-on store
+3. Install **Malem BlueT** from the add-on store
 4. Configure MQTT credentials in the **Configuration** tab
 5. Start the add-on
 

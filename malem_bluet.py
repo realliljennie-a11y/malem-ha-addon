@@ -1,6 +1,6 @@
 """
-Malem Alarm — Home Assistant Add-on
-Listens for Malem BLE moisture sensor events and publishes to MQTT
+Malem BlueT — Home Assistant Add-on
+Listens for Malem BlueT BLE moisture sensor events and publishes to MQTT
 with Home Assistant MQTT discovery, so the sensor auto-appears in HA.
 
 Connection strategy:
@@ -267,42 +267,54 @@ async def connect_and_auth(address: str, cache_warmed: bool = False) -> BleakCli
     """
     Connect and authenticate.
 
-    If cache_warmed=False (first attempt): let connect() run normally so
-    BlueZ can complete service discovery and populate its cache. This attempt
-    will likely fail (device drops connection after 3s) but it warms the cache
-    for all subsequent attempts.
+    run.sh pre-connects via bluetoothctl which completes service discovery
+    in ~1s and leaves services in BlueZ's in-memory cache. We then connect
+    with dangerous_use_bleak_cache=True which returns instantly, and auth
+    via hardcoded D-Bus paths.
 
-    If cache_warmed=True: BlueZ has the cache, so GATT objects appear quickly.
-    Run connect() as a background task, poll until GATT objects are ready,
-    auth immediately, then let discovery finish in the background.
+    If the cache is cold (first run or after adapter reset), we fall back
+    to the concurrent auth approach.
     """
     ble_device = await scan_for_device(address)
-    log.info(f"Connecting to {address}... (cache_warmed={cache_warmed})")
+    log.info(f"Connecting to {address}...")
 
     client = BleakClient(ble_device, timeout=15.0)
 
-    if not cache_warmed:
-        # First attempt: let BlueZ do full discovery to warm the cache.
-        # This will likely fail because the device disconnects before discovery
-        # completes, but it populates the BlueZ service cache for next time.
-        log.info("Warming BlueZ cache — discovery will run, auth may fail this attempt")
-        try:
-            await asyncio.wait_for(
-                client.connect(dangerous_use_bleak_cache=False),
-                timeout=12.0
-            )
-        except Exception as e:
-            log.info(f"Cache warm attempt: {e} (expected if device disconnected)")
-        raise BleakError("Authentication failed")  # force retry with warm cache
+    # Try sequential approach first — fast if BlueZ cache is warm
+    try:
+        await asyncio.wait_for(
+            client.connect(dangerous_use_bleak_cache=True),
+            timeout=4.0
+        )
+        if client.is_connected:
+            log.info("Connected (cache hit)")
+            if await auth_via_dbus(client, address):
+                return client
+            await client.disconnect()
+            raise BleakError("Authentication failed")
+    except asyncio.TimeoutError:
+        log.info("Sequential connect timed out — trying concurrent auth approach")
+        if client.is_connected:
+            await client.disconnect()
+    except BleakError as e:
+        if "Authentication failed" in str(e):
+            raise
+        log.info(f"Sequential connect: {e} — trying concurrent auth approach")
+        if client.is_connected:
+            await client.disconnect()
 
-    # Start connect as background task — it blocks on service discovery
+    # Cache miss — use concurrent auth approach
+    # Re-scan to get fresh BLEDevice
+    ble_device = await scan_for_device(address)
+    client = BleakClient(ble_device, timeout=15.0)
+
     connect_task = asyncio.ensure_future(
-        client.connect(dangerous_use_bleak_cache=True)
+        client.connect(dangerous_use_bleak_cache=False)
     )
 
     auth_ok = False
     try:
-        # Poll until BLE link is up (happens well before discovery completes)
+        # Wait for BLE link
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             await asyncio.sleep(0.1)
@@ -311,11 +323,8 @@ async def connect_and_auth(address: str, cache_warmed: bool = False) -> BleakCli
         else:
             raise BleakError("Timed out waiting for BLE connection")
 
-        log.info("Connected — waiting for GATT objects then authenticating...")
+        log.info("Connected — polling for GATT objects...")
 
-        # Poll until the auth characteristic D-Bus object exists.
-        # BlueZ registers GATT objects shortly after connection — we wait
-        # up to 2.5s, which leaves 0.5s margin within the 3s auth window.
         paths = dbus_paths(address)
         from dbus_fast.message import Message
         from bleak.backends.bluezdbus import defs
@@ -343,18 +352,12 @@ async def connect_and_auth(address: str, cache_warmed: bool = False) -> BleakCli
                 pass
 
         if not challenge_ready:
-            log.error("GATT objects not available within 2.5s auth window")
-            raise BleakError("GATT objects not available within auth window")
-
-        elapsed_waiting = time.monotonic() - (gatt_deadline - 2.5)
-        log.info(f"GATT objects ready after {elapsed_waiting:.2f}s — authenticating...")
+            log.warning("GATT objects not ready within 2.5s — attempting auth anyway")
 
         auth_ok = await auth_via_dbus(client, address)
 
     finally:
         if not auth_ok:
-            # Don't cancel connect_task — let it finish so BlueZ cleans up properly
-            # Just wait briefly for it
             try:
                 await asyncio.wait_for(asyncio.shield(connect_task), timeout=5.0)
             except Exception:
@@ -367,7 +370,6 @@ async def connect_and_auth(address: str, cache_warmed: bool = False) -> BleakCli
             if not auth_ok:
                 raise BleakError("Authentication failed")
 
-    # Wait for connect task (service discovery) to finish
     try:
         await asyncio.wait_for(asyncio.shield(connect_task), timeout=12.0)
     except (asyncio.TimeoutError, BleakError, asyncio.CancelledError) as e:
@@ -471,7 +473,7 @@ def publish_discovery_moisture():
         "json_attributes_topic": TOPIC_MOISTURE_ATTRS,
         "device": {
             "identifiers": [TOPIC_PREFIX],
-            "name": "Malem Alarm",
+            "name": "Malem BlueT",
             "model": "Malem BLE Moisture Sensor",
             "manufacturer": "Malem",
         },
@@ -493,7 +495,7 @@ def publish_discovery_battery():
         "payload_not_available": "offline",
         "device": {
             "identifiers": [TOPIC_PREFIX],
-            "name": "Malem Alarm",
+            "name": "Malem BlueT",
             "model": "Malem BLE Moisture Sensor",
             "manufacturer": "Malem",
         },
