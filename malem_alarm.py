@@ -589,10 +589,16 @@ async def main():
             log.error(f"BLE error: {e}")
 
             if "failed to discover services" in err:
-                # Discovery race — don't remove device, retry with existing cache
                 disc_failures += 1
-                log.info(f"Discovery failure {disc_failures} — retrying without removing device")
-                await asyncio.sleep(3)
+                # After 3 consecutive discovery failures, remove device and try fresh.
+                # Fewer than 3: retry without removing so BlueZ cache can warm up.
+                if disc_failures % 3 == 0:
+                    log.warning(f"Discovery failure {disc_failures} — removing device for fresh attempt")
+                    await remove_device(address)
+                    await asyncio.sleep(5)
+                else:
+                    log.info(f"Discovery failure {disc_failures} — retrying without removing device")
+                    await asyncio.sleep(3)
 
             elif "Authentication failed" in err:
                 # Auth failed — remove device and try fresh
