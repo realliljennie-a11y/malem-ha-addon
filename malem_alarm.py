@@ -139,6 +139,47 @@ def generate_auth_response(tempid: int) -> bytes:
 
 # ── BLE connection ────────────────────────────────────────────────────────────
 
+async def remove_device(address: str):
+    """
+    Remove the device from BlueZ completely, clearing all stale state.
+
+    After an unexpected disconnect BlueZ keeps the device object in a
+    partially-connected state. GetManagedObjects still returns the device
+    but without GATT characteristic objects, so auth_via_dbus() fails.
+    Removing the device forces BlueZ to treat the next connection as a
+    completely fresh one — new scan, new service discovery, new cache.
+
+    Equivalent to: bluetoothctl remove <address>
+    """
+    from dbus_fast.message import Message
+    from bleak.backends.bluezdbus import defs
+    from bleak.backends.bluezdbus.manager import get_global_bluez_manager
+
+    try:
+        manager = await get_global_bluez_manager()
+        mac_nodash = address.upper().replace(":", "_")
+
+        # Find the adapter path
+        adapter_path = manager.get_default_adapter()
+        device_path = f"{adapter_path}/dev_{mac_nodash}"
+
+        assert manager._bus is not None
+        reply = await manager._bus.call(
+            Message(
+                destination=defs.BLUEZ_SERVICE,
+                path=adapter_path,
+                interface=defs.ADAPTER_INTERFACE,
+                member="RemoveDevice",
+                signature="o",
+                body=[device_path],
+            )
+        )
+        log.info(f"Removed device {address} from BlueZ")
+    except Exception as e:
+        # Non-fatal — device may already be gone
+        log.debug(f"Remove device: {e}")
+
+
 async def scan_for_device(address: str):
     """
     Scan briefly to register the device with BlueZ and get a BLEDevice object
@@ -592,6 +633,10 @@ async def main():
                 # Auth via raw D-Bus before service discovery completes
                 if not await auth_via_dbus(client):
                     failures += 1
+                    # Remove device from BlueZ so next attempt gets a clean slate
+                    log.info("Auth failed — removing device from BlueZ for clean reconnect")
+                    await client.disconnect()
+                    await remove_device(address)
                     await asyncio.sleep(3)
                     continue
 
@@ -599,7 +644,8 @@ async def main():
 
                 # Now wait for service discovery to complete — no time pressure
                 if not await wait_for_services(client):
-                    log.error("Service discovery failed — reconnecting")
+                    log.error("Service discovery failed — removing device and reconnecting")
+                    await remove_device(address)
                     continue
 
                 battery = await read_battery(client)
@@ -614,6 +660,10 @@ async def main():
                 if client.is_connected:
                     await client.disconnect()
 
+            # Clean removal after every session so next connect starts fresh
+            await remove_device(address)
+            await asyncio.sleep(1)
+
         except asyncio.TimeoutError:
             log.warning("Connection timed out — retrying")
             await asyncio.sleep(2)
@@ -622,7 +672,8 @@ async def main():
             failures += 1
             log.error(f"BLE error ({failures}): {e}")
             if failures % 3 == 0:
-                log.warning("3 consecutive failures — will retry")
+                log.warning("3 consecutive failures — removing device and retrying")
+                await remove_device(address)
             await asyncio.sleep(3)
 
         except Exception as e:
