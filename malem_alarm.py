@@ -5,22 +5,24 @@ with Home Assistant MQTT discovery, so the sensor auto-appears in HA.
 
 Connection strategy:
   The Malem device disconnects if auth doesn't complete within ~3 seconds
-  of connection. Bleak's normal connect() does full BLE service discovery
-  which takes 2-4 seconds — too slow.
+  of connection. client.connect() blocks until BlueZ service discovery
+  completes (~3-8s on a cold connection) — too slow.
 
-  Solution: authenticate using raw D-Bus calls with hardcoded characteristic
-  paths (confirmed from live D-Bus trace). This completes in ~0.1s regardless
-  of discovery state. Service discovery then completes at leisure after auth.
+  Fix: run connect() as a background task, poll until the BLE link is up
+  (~0.2s), then immediately auth via hardcoded D-Bus paths (~0.1s). Let
+  discovery finish in the background with no time pressure.
 
-  D-Bus characteristic paths (fixed by device firmware, all Malem units):
+  D-Bus paths (fixed by device firmware, confirmed from live D-Bus trace):
     fff1 (auth write):     service0028/char0029
     fff2 (auth challenge): service0028/char002c
     fff4 (status):         service0028/char0032
     2a19 (battery):        service0023/char0024
 
-  On unexpected disconnect: remove device from BlueZ (clears stale state),
-  then rescan and reconnect. Do NOT remove on discovery failures — that
-  prevents BlueZ from building a warm cache.
+Recovery strategy:
+  - After clean disconnect: remove device from BlueZ, rescan, reconnect
+  - After discovery failures < 20s: retry without disturbing BlueZ state
+  - After discovery failures > 20s: remove device, wait, retry
+  - After adapter appears stuck: btmgmt power cycle
 """
 
 import asyncio
@@ -28,6 +30,7 @@ import json
 import logging
 import os
 import random
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -148,8 +151,7 @@ def generate_auth_response(tempid: int) -> bytes:
 async def auth_via_dbus(client: BleakClient, address: str) -> bool:
     """
     Authenticate using raw D-Bus calls with hardcoded characteristic paths.
-    Completes in ~0.1s, well within the 3-second auth window, regardless of
-    whether BlueZ service discovery has completed.
+    Completes in ~0.1s regardless of discovery state.
     """
     from dbus_fast.message import Message
     from dbus_fast.signature import Variant
@@ -200,13 +202,10 @@ async def auth_via_dbus(client: BleakClient, address: str) -> bool:
         return False
 
 
-# ── BlueZ device management ───────────────────────────────────────────────────
+# ── BlueZ management ──────────────────────────────────────────────────────────
 
 async def remove_device(address: str):
-    """
-    Remove device from BlueZ, clearing all stale connection/service state.
-    Called only after unexpected disconnects, not after discovery failures.
-    """
+    """Remove device from BlueZ, clearing stale connection/service state."""
     from dbus_fast.message import Message
     from bleak.backends.bluezdbus import defs
     from bleak.backends.bluezdbus.manager import get_global_bluez_manager
@@ -216,9 +215,8 @@ async def remove_device(address: str):
         adapter_path = manager.get_default_adapter()
         mac_nodash = address.upper().replace(":", "_")
         device_path = f"{adapter_path}/dev_{mac_nodash}"
-
         assert manager._bus is not None
-        reply = await manager._bus.call(Message(
+        await manager._bus.call(Message(
             destination=defs.BLUEZ_SERVICE,
             path=adapter_path,
             interface=defs.ADAPTER_INTERFACE,
@@ -232,12 +230,7 @@ async def remove_device(address: str):
 
 
 async def reset_adapter():
-    """
-    Power-cycle the Bluetooth adapter to flush stuck connection state.
-    Equivalent to hciconfig hci0 reset — resets firmware without unloading driver.
-    Called after repeated discovery failures when remove_device alone isn't enough.
-    """
-    import subprocess
+    """Power-cycle BT adapter to flush stuck firmware state."""
     try:
         log.warning("Resetting Bluetooth adapter...")
         subprocess.run(["btmgmt", "power", "off"], capture_output=True, timeout=5)
@@ -245,11 +238,11 @@ async def reset_adapter():
         subprocess.run(["btmgmt", "power", "on"], capture_output=True, timeout=5)
         await asyncio.sleep(3)
         log.warning("Bluetooth adapter reset complete")
-        return True
     except Exception as e:
         log.error(f"Adapter reset failed: {e}")
-        return False
 
+
+# ── connection ────────────────────────────────────────────────────────────────
 
 async def scan_for_device(address: str):
     """Scan until device is seen, returning BLEDevice with correct D-Bus path."""
@@ -271,29 +264,63 @@ async def scan_for_device(address: str):
 
 async def connect_and_auth(address: str) -> BleakClient:
     """
-    Scan, connect, and authenticate. Auth uses hardcoded D-Bus paths so it
-    completes before service discovery, easily fitting within the 3s window.
+    Connect and authenticate concurrently.
+
+    client.connect() blocks until BlueZ service discovery completes (3-8s).
+    The Malem device drops the connection after ~3s without auth.
+    So we run connect() as a background task, poll until the BLE link is
+    established (~0.2s), immediately auth via D-Bus (~0.1s), then let
+    discovery finish in the background.
     """
     ble_device = await scan_for_device(address)
     log.info(f"Connecting to {address}...")
 
     client = BleakClient(ble_device, timeout=15.0)
-    await client.connect(dangerous_use_bleak_cache=True)
 
-    if not client.is_connected:
-        raise BleakError("Failed to connect")
+    # Start connect as background task — it blocks on service discovery
+    connect_task = asyncio.ensure_future(
+        client.connect(dangerous_use_bleak_cache=True)
+    )
 
-    log.info("Connected")
+    # Poll until BLE link is up (happens well before discovery completes)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+        if client._backend._is_connected:
+            break
+    else:
+        connect_task.cancel()
+        try:
+            await connect_task
+        except Exception:
+            pass
+        raise BleakError("Timed out waiting for BLE connection")
+
+    log.info("Connected — authenticating before service discovery completes...")
 
     if not await auth_via_dbus(client, address):
-        await client.disconnect()
+        connect_task.cancel()
+        try:
+            await asyncio.wait_for(connect_task, timeout=3)
+        except Exception:
+            pass
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
         raise BleakError("Authentication failed")
+
+    # Wait for connect task (service discovery) to finish
+    try:
+        await asyncio.wait_for(asyncio.shield(connect_task), timeout=12.0)
+    except (asyncio.TimeoutError, BleakError) as e:
+        log.warning(f"Service discovery in connect task: {e} — will wait separately")
 
     return client
 
 
 async def wait_for_services(client: BleakClient, timeout: float = 15.0) -> bool:
-    """Wait for service discovery to complete. No time pressure after auth."""
+    """Wait for service discovery to complete after auth. No time pressure."""
     if client.services is not None:
         return True
 
@@ -568,9 +595,9 @@ async def main():
             await find_and_save_device()
             return
 
-    disc_failures = 0  # consecutive "failed to discover services" errors
-    auth_failures = 0  # consecutive auth failures
-    first_disc_failure_time = None  # when the current discovery failure streak started
+    disc_failures = 0
+    auth_failures = 0
+    first_disc_failure_time = None
 
     while True:
         client = None
@@ -582,8 +609,6 @@ async def main():
             mqtt_client.publish(TOPIC_AVAILABILITY, "online", retain=True)
 
             if not await wait_for_services(client):
-                # Discovery failed — don't remove device, just retry
-                # BlueZ may build a warm cache on the next attempt
                 disc_failures += 1
                 log.warning(f"Service discovery failed ({disc_failures}) — retrying")
                 await asyncio.sleep(2)
@@ -597,8 +622,8 @@ async def main():
 
             await monitor(client, address, has_battery)
 
-            # Clean session end — remove device so next connect is fresh
-            log.info("Session ended cleanly — removing device for fresh reconnect")
+            # Clean session end
+            log.info("Session ended — removing device for fresh reconnect")
             await remove_device(address)
             await asyncio.sleep(1)
 
@@ -614,32 +639,36 @@ async def main():
                 disc_failures += 1
                 if first_disc_failure_time is None:
                     first_disc_failure_time = time.monotonic()
-
                 elapsed = time.monotonic() - first_disc_failure_time
 
-                if elapsed > 20.0:
-                    # Device has been unavailable for a while — remove for clean slate
-                    log.warning(f"Discovery failing for {elapsed:.0f}s — removing device for fresh attempt")
+                if elapsed > 60.0:
+                    # Stuck for a long time — reset adapter
+                    log.warning(f"Discovery failing for {elapsed:.0f}s — resetting adapter")
+                    await remove_device(address)
+                    await reset_adapter()
+                    first_disc_failure_time = None
+                    disc_failures = 0
+                elif elapsed > 20.0:
+                    # Unavailable for a while — remove for clean slate
+                    log.warning(f"Discovery failing for {elapsed:.0f}s — removing device")
                     await remove_device(address)
                     first_disc_failure_time = None
                     disc_failures = 0
                     await asyncio.sleep(5)
                 else:
-                    log.info(f"Discovery failure {disc_failures} ({elapsed:.0f}s) — retrying without removing device")
+                    log.info(f"Discovery failure {disc_failures} ({elapsed:.0f}s) — retrying")
                     await asyncio.sleep(3)
 
             elif "Authentication failed" in err:
-                # Auth failed — remove device and try fresh
                 auth_failures += 1
-                log.warning(f"Auth failure {auth_failures} — removing device for clean retry")
+                log.warning(f"Auth failure {auth_failures} — removing device")
                 await remove_device(address)
                 await asyncio.sleep(3)
 
             else:
-                # Unknown BLE error — remove device after 3 failures
                 disc_failures += 1
                 if disc_failures % 3 == 0:
-                    log.warning("3 failures — removing device and retrying")
+                    log.warning("Repeated failures — removing device")
                     await remove_device(address)
                 await asyncio.sleep(3)
 
