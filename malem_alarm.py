@@ -662,9 +662,7 @@ async def main():
 
             await monitor(client, address, has_battery)
 
-            # Clean session end
-            log.info("Session ended — removing device for fresh reconnect")
-            await remove_device(address)
+            # Session ended — leave device registered in BlueZ so cache stays warm
             await asyncio.sleep(1)
 
         except asyncio.TimeoutError:
@@ -684,17 +682,9 @@ async def main():
                 if elapsed > 60.0:
                     # Stuck for a long time — reset adapter
                     log.warning(f"Discovery failing for {elapsed:.0f}s — resetting adapter")
-                    await remove_device(address)
                     await reset_adapter()
                     first_disc_failure_time = None
                     disc_failures = 0
-                elif elapsed > 20.0:
-                    # Unavailable for a while — remove for clean slate
-                    log.warning(f"Discovery failing for {elapsed:.0f}s — removing device")
-                    await remove_device(address)
-                    first_disc_failure_time = None
-                    disc_failures = 0
-                    await asyncio.sleep(5)
                 else:
                     log.info(f"Discovery failure {disc_failures} ({elapsed:.0f}s) — retrying")
                     await asyncio.sleep(3)
@@ -703,18 +693,16 @@ async def main():
                 auth_failures += 1
                 if auth_failures % 6 == 0:
                     log.warning(f"Auth failure {auth_failures} — resetting adapter")
-                    await remove_device(address)
                     await reset_adapter()
                 else:
-                    log.warning(f"Auth failure {auth_failures} — removing device")
-                    await remove_device(address)
+                    log.warning(f"Auth failure {auth_failures} — retrying")
                     await asyncio.sleep(3)
 
             else:
                 disc_failures += 1
-                if disc_failures % 3 == 0:
-                    log.warning("Repeated failures — removing device")
-                    await remove_device(address)
+                if disc_failures % 6 == 0:
+                    log.warning(f"Repeated failures ({disc_failures}) — resetting adapter")
+                    await reset_adapter()
                 await asyncio.sleep(3)
 
         except Exception as e:
