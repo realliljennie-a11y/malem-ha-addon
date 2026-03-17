@@ -483,10 +483,11 @@ async def main():
     try:
         client = await connect_and_auth(address)
     except Exception as e:
-        log.error(f"Connect/auth failed: {e}")
+        log.error(f"Connect/auth failed: {e} — exiting for restart")
         mqtt_client.publish(TOPIC_AVAILABILITY, "offline", retain=True)
-        await asyncio.sleep(2)
-        sys.exit(1)  # s6 will restart, run.sh will re-establish bluetoothctl connection
+        # Brief delay prevents s6 from classifying this as a crash loop
+        await asyncio.sleep(5)
+        sys.exit(0)  # exit 0 so s6 restarts normally (not permanent stop)
 
     mqtt_client.publish(TOPIC_AVAILABILITY, "online", retain=True)
 
@@ -495,7 +496,10 @@ async def main():
         publish_battery(battery)
 
     await monitor(client, address, battery is not None)
-    # monitor() exits on disconnect — sys.exit triggers s6 restart
+    # monitor() returns on disconnect — exit so s6 restarts
+    log.info("Exiting for restart...")
+    await asyncio.sleep(5)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

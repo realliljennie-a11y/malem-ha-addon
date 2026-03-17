@@ -14,9 +14,8 @@ bashio::log.info "MQTT: ${MQTT_HOST}:${MQTT_PORT}, prefix: ${MQTT_TOPIC_PREFIX}"
 
 # ── Pre-connect via bluetoothctl ──────────────────────────────────────────────
 # bluetoothctl completes service discovery in ~1s. We connect and leave the
-# connection open. Python then attaches to the already-connected device —
-# BlueZ skips the "Connect" D-Bus call and goes straight to service lookup
-# which is instant since discovery already happened.
+# connection open so Python can auth immediately without triggering discovery.
+# Retry until the device is available — it may be off or charging.
 
 SENSOR_MAC_RESOLVED=""
 if [ -n "$SENSOR_MAC" ]; then
@@ -26,12 +25,16 @@ elif [ -f "/config/malem_state.json" ]; then
 fi
 
 if [ -n "$SENSOR_MAC_RESOLVED" ]; then
-    bashio::log.info "Pre-connecting via bluetoothctl..."
-    bluetoothctl connect "$SENSOR_MAC_RESOLVED" 2>/dev/null || true
-    # Leave connected — Python will attach to existing connection
-    # Give BlueZ a moment to finish registering GATT objects
-    sleep 1
-    bashio::log.info "Pre-connect done — handing off to Python"
+    bashio::log.info "Waiting for device ${SENSOR_MAC_RESOLVED}..."
+    while true; do
+        OUTPUT=$(bluetoothctl connect "$SENSOR_MAC_RESOLVED" 2>&1)
+        if echo "$OUTPUT" | grep -q "Connection successful"; then
+            bashio::log.info "Connected — handing off to Python"
+            break
+        fi
+        bashio::log.info "Device not ready (${OUTPUT##*$'\n'}) — retrying in 5s..."
+        sleep 5
+    done
 else
     bashio::log.info "No MAC known yet — Python will handle first-run discovery"
 fi
