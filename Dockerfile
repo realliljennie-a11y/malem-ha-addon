@@ -19,7 +19,7 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 
 WORKDIR /app
 COPY run.sh /
-COPY malem_alarm.py /app/
+COPY malem_bluet.py /app/
 
 RUN chmod +x /run.sh
 
