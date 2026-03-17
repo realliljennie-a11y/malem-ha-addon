@@ -13,11 +13,12 @@ bashio::log.info "Starting Malem Alarm listener..."
 bashio::log.info "MQTT: ${MQTT_HOST}:${MQTT_PORT}, prefix: ${MQTT_TOPIC_PREFIX}"
 
 # ── Write BlueZ GATT service cache ────────────────────────────────────────────
-# Pre-populating the cache tells BlueZ the service layout so it skips BLE
-# discovery on connect — critical because the Malem sensor drops the connection
-# if auth doesn't complete within ~3 seconds.
+# Pre-populating the cache with correct handle numbers (derived from debug logs
+# of a live connection) tells BlueZ the full service layout so it can skip BLE
+# service discovery on connect. This is critical because the Malem sensor
+# disconnects if auth doesn't complete within ~3 seconds.
 #
-# MAC source priority: config override → state file → skip (first run)
+# Handles are fixed by device firmware and never change between connections.
 
 write_cache() {
     local MAC="$1"
@@ -29,7 +30,7 @@ write_cache() {
         mkdir -p "$CACHE_DIR"
         CACHE_FILE="${CACHE_DIR}/${MAC}"
 
-        bashio::log.info "Writing BlueZ cache for ${MAC}: ${CACHE_FILE}"
+        bashio::log.info "Writing BlueZ service cache: ${CACHE_FILE}"
 
         cat > "$CACHE_FILE" << CACHE
 [General]
@@ -43,34 +44,69 @@ UUID=00001800-0000-1000-8000-00805f9b34fb
 Primary=true
 Device=/org/bluez/hci0/dev_${MAC_NODASH}
 
-[/org/bluez/hci0/dev_${MAC_NODASH}/service0014]
+[/org/bluez/hci0/dev_${MAC_NODASH}/service0001/char0002]
+UUID=00002a00-0000-1000-8000-00805f9b34fb
+Value=
+Flags=read
+
+[/org/bluez/hci0/dev_${MAC_NODASH}/service000c]
+UUID=00001801-0000-1000-8000-00805f9b34fb
+Primary=true
+Device=/org/bluez/hci0/dev_${MAC_NODASH}
+
+[/org/bluez/hci0/dev_${MAC_NODASH}/service0010]
+UUID=0000180a-0000-1000-8000-00805f9b34fb
+Primary=true
+Device=/org/bluez/hci0/dev_${MAC_NODASH}
+
+[/org/bluez/hci0/dev_${MAC_NODASH}/service0023]
+UUID=0000180f-0000-1000-8000-00805f9b34fb
+Primary=true
+Device=/org/bluez/hci0/dev_${MAC_NODASH}
+
+[/org/bluez/hci0/dev_${MAC_NODASH}/service0023/char0024]
+UUID=00002a19-0000-1000-8000-00805f9b34fb
+Value=
+Flags=read,notify
+
+[/org/bluez/hci0/dev_${MAC_NODASH}/service0028]
 UUID=0000fff0-0000-1000-8000-00805f9b34fb
 Primary=true
 Device=/org/bluez/hci0/dev_${MAC_NODASH}
 
-[/org/bluez/hci0/dev_${MAC_NODASH}/service0014/char0015]
+[/org/bluez/hci0/dev_${MAC_NODASH}/service0028/char0029]
 UUID=0000fff1-0000-1000-8000-00805f9b34fb
 Value=
-Flags=write
+Flags=read,write
 
-[/org/bluez/hci0/dev_${MAC_NODASH}/service0014/char0017]
+[/org/bluez/hci0/dev_${MAC_NODASH}/service0028/char002c]
 UUID=0000fff2-0000-1000-8000-00805f9b34fb
 Value=
 Flags=read
 
-[/org/bluez/hci0/dev_${MAC_NODASH}/service0014/char0019]
+[/org/bluez/hci0/dev_${MAC_NODASH}/service0028/char002f]
+UUID=0000fff3-0000-1000-8000-00805f9b34fb
+Value=
+Flags=write
+
+[/org/bluez/hci0/dev_${MAC_NODASH}/service0028/char0032]
 UUID=0000fff4-0000-1000-8000-00805f9b34fb
 Value=
 Flags=read,notify
 
-[/org/bluez/hci0/dev_${MAC_NODASH}/service0014/char0019/desc001b]
+[/org/bluez/hci0/dev_${MAC_NODASH}/service0028/char0032/desc0034]
 UUID=00002902-0000-1000-8000-00805f9b34fb
 Value=0000
+
+[/org/bluez/hci0/dev_${MAC_NODASH}/service0028/char0036]
+UUID=0000fff5-0000-1000-8000-00805f9b34fb
+Value=
+Flags=read
 CACHE
     done
 }
 
-# Determine MAC to cache
+# Determine MAC to cache — config override takes priority, then state file
 CACHE_MAC=""
 if [ -n "$SENSOR_MAC" ]; then
     CACHE_MAC="$SENSOR_MAC"
@@ -85,28 +121,7 @@ fi
 if [ -n "$CACHE_MAC" ]; then
     write_cache "$CACHE_MAC"
 else
-    bashio::log.info "No MAC known yet — first run, will scan and restart"
+    bashio::log.info "No MAC known yet — will discover on first run"
 fi
 
-# ── Run the Python script ─────────────────────────────────────────────────────
-# Exit code 2 means the script discovered the MAC on a first run and saved it.
-# We write the cache and restart immediately in that case.
-
-while true; do
-    python3 /app/malem_alarm.py
-    EXIT_CODE=$?
-
-    if [ $EXIT_CODE -eq 2 ]; then
-        bashio::log.info "MAC discovered — writing cache and restarting..."
-        CACHE_MAC=$(python3 -c "import json; d=json.load(open('/config/malem_state.json')); print(d.get('sensor_mac',''))" 2>/dev/null)
-        if [ -n "$CACHE_MAC" ]; then
-            write_cache "$CACHE_MAC"
-        fi
-        bashio::log.info "Restarting..."
-        sleep 1
-        # Loop continues, restarting the Python script with cache now in place
-    else
-        # Any other exit code — let s6 handle the restart
-        exit $EXIT_CODE
-    fi
-done
+exec python3 /app/malem_alarm.py
