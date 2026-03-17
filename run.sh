@@ -20,9 +20,11 @@ elif [ -f "/config/malem_state.json" ]; then
 fi
 
 if [ -n "$SENSOR_MAC_RESOLVED" ]; then
-    bashio::log.info "Waiting for device ${SENSOR_MAC_RESOLVED}..."
+    bashio::log.info "Connecting to ${SENSOR_MAC_RESOLVED}..."
     CONNECTED=0
     while [ $CONNECTED -eq 0 ]; do
+        # Scan first to register device with BlueZ, then connect
+        bluetoothctl --timeout 5 scan on 2>/dev/null || true
         if bluetoothctl connect "$SENSOR_MAC_RESOLVED" 2>&1 | grep -q "Connection successful"; then
             CONNECTED=1
             bashio::log.info "Connected — handing off to Python"
