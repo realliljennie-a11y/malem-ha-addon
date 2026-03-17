@@ -9,24 +9,34 @@ loaded from that file — no manual configuration required.
 
 Connection strategy:
   The Malem device disconnects if auth doesn't complete within ~3 seconds.
-  Bleak's normal connect() does two slow things: a pre-connect BLE scan, and
-  service discovery (waiting for BlueZ ServicesResolved). We bypass both:
+  We bypass both slow steps in bleak's connect():
 
-  1. Pre-set _device_path so the pre-connect scan is skipped.
-  2. Auth using raw D-Bus calls (GetManagedObjects to find characteristic
-     paths, then ReadValue/WriteValue directly) — this is fast because it
-     uses the D-Bus object manager cache, not BLE traffic.
-  3. After auth, trigger normal service discovery at leisure (no time limit).
+  1. Pre-connect scan — we do our own scan first to get a BLEDevice object
+     with the correct BlueZ D-Bus path, then pass it to BleakClient directly.
+
+  2. Service discovery — auth uses raw D-Bus calls with hardcoded
+     characteristic paths (determined from the device firmware, fixed across
+     all units). No GetManagedObjects needed, no dependency on discovery state.
+     After auth succeeds the connection is stable, so service discovery can
+     complete at leisure for the normal bleak polling/notification operations.
+
+GATT layout (confirmed via live D-Bus trace):
+  service0028 (fff0):
+    char0029  fff1  write       auth response
+    char002c  fff2  read        auth challenge
+    char0032  fff4  read+notify moisture status
+  service0023 (180f):
+    char0024  2a19  read+notify battery level
 
 MQTT topics published:
   {prefix}/moisture/state          "wet" | "dry"
   {prefix}/moisture/attributes     JSON: last_wet_duration, last_wet_time
   {prefix}/moisture/availability   "online" | "offline"
-  {prefix}/battery/state           0-100 (if supported by device)
+  {prefix}/battery/state           0-100
 
 HA discovery topics:
   homeassistant/binary_sensor/{prefix}_moisture/config
-  homeassistant/sensor/{prefix}_battery/config   (if battery found)
+  homeassistant/sensor/{prefix}_battery/config
 """
 
 import asyncio
@@ -66,7 +76,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("malem")
 
-# ── BLE constants ─────────────────────────────────────────────────────────────
+# ── BLE UUIDs (for bleak polling/notify after auth) ───────────────────────────
 
 DEVICE_NAME         = "MALEM ALARM"
 CHAR_AUTH_WRITE     = "0000fff1-0000-1000-8000-00805f9b34fb"
@@ -74,11 +84,49 @@ CHAR_AUTH_CHALLENGE = "0000fff2-0000-1000-8000-00805f9b34fb"
 CHAR_STATUS         = "0000fff4-0000-1000-8000-00805f9b34fb"
 CHAR_BATTERY        = "00002a19-0000-1000-8000-00805f9b34fb"
 
+# Hardcoded D-Bus characteristic paths — derived from debug logs of a live
+# connection. These are fixed by the device firmware and never change.
+# Using hardcoded paths means auth_via_dbus() never needs GetManagedObjects,
+# making it immune to service discovery timing issues.
+DBUS_BASE           = "/org/bluez/hci0/dev_{mac}"
+DBUS_AUTH_WRITE     = "/org/bluez/hci0/dev_{mac}/service0028/char0029"
+DBUS_AUTH_CHALLENGE = "/org/bluez/hci0/dev_{mac}/service0028/char002c"
+DBUS_STATUS         = "/org/bluez/hci0/dev_{mac}/service0028/char0032"
+DBUS_STATUS_CCC     = "/org/bluez/hci0/dev_{mac}/service0028/char0032/desc0034"
+DBUS_BATTERY        = "/org/bluez/hci0/dev_{mac}/service0023/char0024"
+
+# Hardcoded D-Bus paths for the Malem device's GATT characteristics.
+# These are determined by the device firmware and never change between
+# connections or power cycles. Using these directly bypasses GetManagedObjects
+# and makes auth immune to service discovery timing.
+# Confirmed from debug log of live connection on 2026-03-17.
+DBUS_DEV_PREFIX     = "/org/bluez/hci0/dev_{mac}"  # {mac} = XX_XX_XX_XX_XX_XX
+DBUS_AUTH_WRITE     = "/org/bluez/hci0/dev_{mac}/service0028/char0029"  # fff1
+DBUS_AUTH_CHALLENGE = "/org/bluez/hci0/dev_{mac}/service0028/char002c"  # fff2
+DBUS_STATUS         = "/org/bluez/hci0/dev_{mac}/service0028/char0032"  # fff4
+DBUS_STATUS_CCC     = "/org/bluez/hci0/dev_{mac}/service0028/char0032/desc0034"  # CCCD
+DBUS_BATTERY        = "/org/bluez/hci0/dev_{mac}/service0023/char0024"  # 2a19
+
 KEY_TABLE = [0x79, 0xA8, 0xBF, 0x90, 0x88, 0x3E, 0x45, 0x13,
              0x46, 0x6C, 0xF9, 0xD7, 0x20, 0xCA, 0x58, 0xDA]
 
 POLL_INTERVAL         = 1.5
 BATTERY_POLL_INTERVAL = 300
+
+# ── hardcoded D-Bus paths ─────────────────────────────────────────────────────
+# Handle numbers are assigned by the Malem device firmware and are identical
+# across all units of this model. Confirmed from live D-Bus trace.
+
+def char_paths(address: str) -> dict:
+    mac = address.upper().replace(":", "_")
+    dev = f"/org/bluez/hci0/dev_{mac}"
+    return {
+        "auth_write":     f"{dev}/service0028/char0029",  # fff1
+        "auth_challenge": f"{dev}/service0028/char002c",  # fff2
+        "status":         f"{dev}/service0028/char0032",  # fff4
+        "status_cccd":    f"{dev}/service0028/char0032/desc0034",
+        "battery":        f"{dev}/service0023/char0024",  # 2a19
+    }
 
 # ── MQTT topics ───────────────────────────────────────────────────────────────
 
@@ -89,7 +137,7 @@ TOPIC_BATTERY_STATE  = f"{TOPIC_PREFIX}/battery/state"
 TOPIC_DISC_MOISTURE  = f"homeassistant/binary_sensor/{TOPIC_PREFIX}_moisture/config"
 TOPIC_DISC_BATTERY   = f"homeassistant/sensor/{TOPIC_PREFIX}_battery/config"
 
-# ── auth key generation ───────────────────────────────────────────────────────
+# ── auth ──────────────────────────────────────────────────────────────────────
 
 def generate_auth_response(tempid: int) -> bytes:
     ranXOR = KEY_TABLE[tempid]
@@ -137,172 +185,33 @@ def generate_auth_response(tempid: int) -> bytes:
     return bytes(send)
 
 
-# ── BLE connection ────────────────────────────────────────────────────────────
-
-async def remove_device(address: str):
+async def auth_via_dbus(client: BleakClient, address: str) -> bool:
     """
-    Remove the device from BlueZ completely, clearing all stale state.
-
-    After an unexpected disconnect BlueZ keeps the device object in a
-    partially-connected state. GetManagedObjects still returns the device
-    but without GATT characteristic objects, so auth_via_dbus() fails.
-    Removing the device forces BlueZ to treat the next connection as a
-    completely fresh one — new scan, new service discovery, new cache.
-
-    Equivalent to: bluetoothctl remove <address>
-    """
-    from dbus_fast.message import Message
-    from bleak.backends.bluezdbus import defs
-    from bleak.backends.bluezdbus.manager import get_global_bluez_manager
-
-    try:
-        manager = await get_global_bluez_manager()
-        mac_nodash = address.upper().replace(":", "_")
-
-        # Find the adapter path
-        adapter_path = manager.get_default_adapter()
-        device_path = f"{adapter_path}/dev_{mac_nodash}"
-
-        assert manager._bus is not None
-        reply = await manager._bus.call(
-            Message(
-                destination=defs.BLUEZ_SERVICE,
-                path=adapter_path,
-                interface=defs.ADAPTER_INTERFACE,
-                member="RemoveDevice",
-                signature="o",
-                body=[device_path],
-            )
-        )
-        log.info(f"Removed device {address} from BlueZ")
-    except Exception as e:
-        # Non-fatal — device may already be gone
-        log.debug(f"Remove device: {e}")
-
-
-async def scan_for_device(address: str):
-    """
-    Scan briefly to register the device with BlueZ and get a BLEDevice object
-    with the correct D-Bus path. BlueZ requires a device to be seen via scan
-    before it can be connected to — we can't construct the path ourselves.
-    Returns as soon as the advertisement is seen.
-    """
-    log.info(f"Scanning for {address}...")
-    found = asyncio.Event()
-    result = [None]
-
-    def on_device(device, adv):
-        if device.address.upper() == address.upper():
-            result[0] = device
-            found.set()
-
-    async with BleakScanner(detection_callback=on_device):
-        await asyncio.wait_for(found.wait(), timeout=30.0)
-
-    log.info(f"Device found (RSSI {getattr(result[0], 'rssi', '?')  } dBm)")
-    return result[0]
-
-
-async def connect_fast(ble_device) -> BleakClient:
-    """
-    Connect using a BLEDevice object from scan_for_device().
-    Passing BLEDevice directly sets _device_path from device.details["path"],
-    giving BlueZ the correct D-Bus object path without manual construction.
-    Service discovery runs concurrently; auth_via_dbus() does auth before
-    it completes so we stay within the device's 3-second auth window.
-    Uses dangerous_use_bleak_cache=True so if BlueZ has previously seen
-    this device it skips BLE re-discovery entirely.
-    """
-    client = BleakClient(ble_device, timeout=15.0)
-    await client.connect(dangerous_use_bleak_cache=True)
-
-    if not client.is_connected:
-        raise BleakError("Failed to connect")
-
-    return client
-
-
-async def auth_via_dbus(client: BleakClient) -> bool:
-    """
-    Authenticate using raw D-Bus calls, bypassing the service collection.
-
-    Uses BlueZ's GetManagedObjects to find characteristic D-Bus paths for
-    our specific UUIDs — one fast D-Bus roundtrip with no BLE traffic.
-    This completes well within the 3-second auth window even when service
-    discovery is still in progress.
+    Authenticate using raw D-Bus calls with hardcoded characteristic paths.
+    Works immediately after connect, before service discovery completes.
     """
     from dbus_fast.message import Message
     from dbus_fast.signature import Variant
     from bleak.backends.bluezdbus import defs
 
     bus = client._backend._bus
-    device_path = client._backend._device_path
-
-    if bus is None or device_path is None:
+    if bus is None:
         log.error("Auth failed: no D-Bus connection")
         return False
 
-    # Get all BlueZ objects in one D-Bus call — uses kernel object cache,
-    # not BLE traffic, so this is fast regardless of discovery state
-    try:
-        reply = await bus.call(
-            Message(
-                destination=defs.BLUEZ_SERVICE,
-                path="/",
-                interface=defs.OBJECT_MANAGER_INTERFACE,
-                member="GetManagedObjects",
-            )
-        )
-    except Exception as e:
-        log.error(f"GetManagedObjects failed: {e}")
-        return False
-
-    if reply.message_type.name == "ERROR":
-        log.error(f"GetManagedObjects error: {reply.error_name}")
-        return False
-
-    objects = reply.body[0]
-
-    # Find D-Bus paths for our two auth characteristics
-    challenge_path = None
-    write_path = None
-
-    for path, interfaces in objects.items():
-        if not path.startswith(device_path):
-            continue
-        char_iface = interfaces.get(defs.GATT_CHARACTERISTIC_INTERFACE)
-        if char_iface is None:
-            continue
-        uuid_variant = char_iface.get("UUID", {})
-        uuid_val = uuid_variant.value if hasattr(uuid_variant, "value") else str(uuid_variant)
-        if uuid_val.lower() == CHAR_AUTH_CHALLENGE.lower():
-            challenge_path = path
-        elif uuid_val.lower() == CHAR_AUTH_WRITE.lower():
-            write_path = path
-
-    if not challenge_path or not write_path:
-        log.error("Auth characteristics not found in D-Bus objects")
-        log.debug(f"Paths under {device_path}: "
-                  f"{[p for p in objects if p.startswith(device_path)]}")
-        return False
-
-    log.debug(f"Challenge: {challenge_path}")
-    log.debug(f"Write:     {write_path}")
+    paths = char_paths(address)
 
     try:
         t0 = time.monotonic()
 
-        # Read challenge byte
-        reply = await bus.call(
-            Message(
-                destination=defs.BLUEZ_SERVICE,
-                path=challenge_path,
-                interface=defs.GATT_CHARACTERISTIC_INTERFACE,
-                member="ReadValue",
-                signature="a{sv}",
-                body=[{}],
-            )
-        )
+        reply = await bus.call(Message(
+            destination=defs.BLUEZ_SERVICE,
+            path=paths["auth_challenge"],
+            interface=defs.GATT_CHARACTERISTIC_INTERFACE,
+            member="ReadValue",
+            signature="a{sv}",
+            body=[{}],
+        ))
         if reply.message_type.name == "ERROR":
             log.error(f"Challenge read failed: {reply.error_name}")
             return False
@@ -310,17 +219,14 @@ async def auth_via_dbus(client: BleakClient) -> bool:
         tempid = reply.body[0][0] & 0xFF
         response = generate_auth_response(tempid)
 
-        # Write auth response
-        reply = await bus.call(
-            Message(
-                destination=defs.BLUEZ_SERVICE,
-                path=write_path,
-                interface=defs.GATT_CHARACTERISTIC_INTERFACE,
-                member="WriteValue",
-                signature="aya{sv}",
-                body=[bytes(response), {"type": Variant("s", "request")}],
-            )
-        )
+        reply = await bus.call(Message(
+            destination=defs.BLUEZ_SERVICE,
+            path=paths["auth_write"],
+            interface=defs.GATT_CHARACTERISTIC_INTERFACE,
+            member="WriteValue",
+            signature="aya{sv}",
+            body=[bytes(response), {"type": Variant("s", "request")}],
+        ))
         if reply.message_type.name == "ERROR":
             log.error(f"Auth write failed: {reply.error_name}")
             return False
@@ -333,24 +239,91 @@ async def auth_via_dbus(client: BleakClient) -> bool:
         return False
 
 
-async def wait_for_services(client: BleakClient, timeout: float = 10.0) -> bool:
+# ── BLE connection ────────────────────────────────────────────────────────────
+
+async def remove_device(address: str):
+    """Remove device from BlueZ to clear stale state after unexpected disconnect."""
+    from dbus_fast.message import Message
+    from bleak.backends.bluezdbus import defs
+    from bleak.backends.bluezdbus.manager import get_global_bluez_manager
+
+    try:
+        manager = await get_global_bluez_manager()
+        mac_nodash = address.upper().replace(":", "_")
+        adapter_path = manager.get_default_adapter()
+        device_path = f"{adapter_path}/dev_{mac_nodash}"
+
+        assert manager._bus is not None
+        reply = await manager._bus.call(Message(
+            destination=defs.BLUEZ_SERVICE,
+            path=adapter_path,
+            interface=defs.ADAPTER_INTERFACE,
+            member="RemoveDevice",
+            signature="o",
+            body=[device_path],
+        ))
+        log.info(f"Removed {address} from BlueZ")
+    except Exception as e:
+        log.debug(f"Remove device (non-fatal): {e}")
+
+
+async def scan_for_device(address: str):
+    """Scan to register device with BlueZ and get a BLEDevice with correct D-Bus path."""
+    log.info(f"Scanning for {address}...")
+    found = asyncio.Event()
+    result = [None]
+
+    def on_device(device, adv):
+        if device.address.upper() == address.upper():
+            result[0] = device
+            found.set()
+
+    async with BleakScanner(detection_callback=on_device):
+        await asyncio.wait_for(found.wait(), timeout=30.0)
+
+    log.info(f"Device found (RSSI {getattr(result[0], 'rssi', '?')} dBm)")
+    return result[0]
+
+
+async def connect_and_auth(address: str) -> BleakClient:
     """
-    Wait for service discovery to complete after auth.
-    No time pressure here — device stays connected indefinitely once authed.
+    Scan, connect, and authenticate within the 3-second auth window.
+    Service discovery runs concurrently but auth uses hardcoded D-Bus paths
+    so it doesn't depend on discovery completing first.
     """
+    ble_device = await scan_for_device(address)
+    log.info(f"Connecting to {address}...")
+    client = BleakClient(ble_device, timeout=15.0)
+    await client.connect(dangerous_use_bleak_cache=True)
+
+    if not client.is_connected:
+        raise BleakError("Failed to connect")
+
+    log.info("Connected")
+
+    if not await auth_via_dbus(client, address):
+        await client.disconnect()
+        raise BleakError("Authentication failed")
+
+    return client
+
+
+async def wait_for_services(client: BleakClient, timeout: float = 15.0) -> bool:
+    """Wait for service discovery to complete after auth."""
     if client.services is not None:
         return True
 
-    log.info("Waiting for service discovery to complete...")
+    log.info("Waiting for service discovery...")
     deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
+        if not client.is_connected:
+            return False
         if client.services is not None:
             log.info("Services resolved")
             return True
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.3)
 
-    # Try forcing discovery via _get_services
     try:
         await client._backend._get_services()
         log.info("Services resolved via _get_services()")
@@ -568,11 +541,11 @@ async def monitor(client: BleakClient, device_address: str, has_battery: bool):
     mqtt_client.publish(TOPIC_AVAILABILITY, "offline", retain=True)
 
 
-# ── scanner ───────────────────────────────────────────────────────────────────
+# ── first-run MAC discovery ───────────────────────────────────────────────────
 
-async def find_and_save_device() -> str:
+async def find_and_save_device():
     """First-run: scan by name, save MAC, exit so s6 restarts with MAC known."""
-    log.info(f"First run — scanning for {DEVICE_NAME} to discover MAC address...")
+    log.info(f"First run — scanning for {DEVICE_NAME}...")
     log.info("This may take up to 60 seconds.")
 
     found = asyncio.Event()
@@ -594,8 +567,7 @@ async def find_and_save_device() -> str:
     state["sensor_mac"] = address
     state["sensor_name"] = DEVICE_NAME
     save_state(state)
-    log.info(f"MAC address saved to {STATE_FILE}")
-    log.info("Restarting to connect...")
+    log.info(f"MAC saved to {STATE_FILE} — restarting...")
     sys.exit(2)
 
 
@@ -605,7 +577,6 @@ async def main():
     mqtt_connect()
     await asyncio.sleep(2)
 
-    # Determine MAC — priority: config override → state file → first-run scan
     if SENSOR_MAC_OVERRIDE:
         address = SENSOR_MAC_OVERRIDE
         log.info(f"Using MAC from config: {address}")
@@ -616,69 +587,55 @@ async def main():
             log.info(f"Using saved MAC: {address}")
         else:
             await find_and_save_device()
-            return  # unreachable
+            return
 
     failures = 0
 
     while True:
+        client = None
         try:
-            ble_device = await scan_for_device(address)
-            log.info(f"Connecting to {address}...")
-            client = await connect_fast(ble_device)
-            log.info("Connected")
+            client = await connect_and_auth(address)
+            failures = 0
+            mqtt_client.publish(TOPIC_AVAILABILITY, "online", retain=True)
 
-            try:
-                mqtt_client.publish(TOPIC_AVAILABILITY, "online", retain=True)
+            if not await wait_for_services(client):
+                log.error("Service discovery failed — reconnecting")
+                await remove_device(address)
+                await asyncio.sleep(2)
+                continue
 
-                # Auth via raw D-Bus before service discovery completes
-                if not await auth_via_dbus(client):
-                    failures += 1
-                    # Remove device from BlueZ so next attempt gets a clean slate
-                    log.info("Auth failed — removing device from BlueZ for clean reconnect")
-                    await client.disconnect()
-                    await remove_device(address)
-                    await asyncio.sleep(3)
-                    continue
+            battery = await read_battery(client)
+            has_battery = battery is not None
+            if has_battery:
+                publish_discovery_battery()
+                publish_battery(battery)
 
-                failures = 0
+            await monitor(client, address, has_battery)
 
-                # Now wait for service discovery to complete — no time pressure
-                if not await wait_for_services(client):
-                    log.error("Service discovery failed — removing device and reconnecting")
-                    await remove_device(address)
-                    continue
-
-                battery = await read_battery(client)
-                has_battery = battery is not None
-                if has_battery:
-                    publish_discovery_battery()
-                    publish_battery(battery)
-
-                await monitor(client, address, has_battery)
-
-            finally:
-                if client.is_connected:
-                    await client.disconnect()
-
-            # Clean removal after every session so next connect starts fresh
+            # After any session end, remove device so next connect is clean
             await remove_device(address)
             await asyncio.sleep(1)
 
         except asyncio.TimeoutError:
-            log.warning("Connection timed out — retrying")
+            log.warning("Scan timed out — retrying")
             await asyncio.sleep(2)
 
         except BleakError as e:
             failures += 1
             log.error(f"BLE error ({failures}): {e}")
-            if failures % 3 == 0:
-                log.warning("3 consecutive failures — removing device and retrying")
-                await remove_device(address)
+            await remove_device(address)
             await asyncio.sleep(3)
 
         except Exception as e:
             log.error(f"Unexpected error: {e}", exc_info=True)
             await asyncio.sleep(3)
+
+        finally:
+            if client is not None and client.is_connected:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
