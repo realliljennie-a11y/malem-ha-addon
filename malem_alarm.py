@@ -176,10 +176,11 @@ async def auth_via_dbus(client: BleakClient, address: str) -> bool:
             body=[{}],
         ))
         if reply.message_type.name == "ERROR":
-            log.error(f"Challenge read failed: {reply.error_name}")
+            log.error(f"Challenge read failed: {reply.error_name} — {reply.body}")
             return False
 
         tempid = reply.body[0][0] & 0xFF
+        log.debug(f"Challenge tempid={tempid}")
         response = generate_auth_response(tempid)
 
         reply = await bus.call(Message(
@@ -191,7 +192,7 @@ async def auth_via_dbus(client: BleakClient, address: str) -> bool:
             body=[bytes(response), {"type": Variant("s", "request")}],
         ))
         if reply.message_type.name == "ERROR":
-            log.error(f"Auth write failed: {reply.error_name}")
+            log.error(f"Auth write failed: {reply.error_name} — {reply.body}")
             return False
 
         log.info(f"Authenticated in {time.monotonic()-t0:.2f}s")
@@ -325,9 +326,11 @@ async def connect_and_auth(address: str) -> BleakClient:
                 pass
 
         if not challenge_ready:
+            log.error("GATT objects not available within 2.5s auth window")
             raise BleakError("GATT objects not available within auth window")
 
-        log.info(f"GATT objects ready at {time.monotonic() - (gatt_deadline - 2.5):.2f}s")
+        elapsed_waiting = time.monotonic() - (gatt_deadline - 2.5)
+        log.info(f"GATT objects ready after {elapsed_waiting:.2f}s — authenticating...")
 
         auth_ok = await auth_via_dbus(client, address)
 
@@ -698,9 +701,14 @@ async def main():
 
             elif "Authentication failed" in err:
                 auth_failures += 1
-                log.warning(f"Auth failure {auth_failures} — removing device")
-                await remove_device(address)
-                await asyncio.sleep(3)
+                if auth_failures % 6 == 0:
+                    log.warning(f"Auth failure {auth_failures} — resetting adapter")
+                    await remove_device(address)
+                    await reset_adapter()
+                else:
+                    log.warning(f"Auth failure {auth_failures} — removing device")
+                    await remove_device(address)
+                    await asyncio.sleep(3)
 
             else:
                 disc_failures += 1
