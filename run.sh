@@ -12,11 +12,6 @@ export SENSOR_MAC=$(bashio::config 'sensor_mac')
 bashio::log.info "Starting Malem BlueT listener..."
 bashio::log.info "MQTT: ${MQTT_HOST}:${MQTT_PORT}, prefix: ${MQTT_TOPIC_PREFIX}"
 
-# ── Pre-connect via bluetoothctl ──────────────────────────────────────────────
-# bluetoothctl completes service discovery in ~1s. We connect and leave the
-# connection open so Python can auth immediately without triggering discovery.
-# Retry until the device is available — it may be off or charging.
-
 SENSOR_MAC_RESOLVED=""
 if [ -n "$SENSOR_MAC" ]; then
     SENSOR_MAC_RESOLVED="$SENSOR_MAC"
@@ -26,14 +21,15 @@ fi
 
 if [ -n "$SENSOR_MAC_RESOLVED" ]; then
     bashio::log.info "Waiting for device ${SENSOR_MAC_RESOLVED}..."
-    while true; do
-        OUTPUT=$(bluetoothctl connect "$SENSOR_MAC_RESOLVED" 2>&1)
-        if echo "$OUTPUT" | grep -q "Connection successful"; then
+    CONNECTED=0
+    while [ $CONNECTED -eq 0 ]; do
+        if bluetoothctl connect "$SENSOR_MAC_RESOLVED" 2>&1 | grep -q "Connection successful"; then
+            CONNECTED=1
             bashio::log.info "Connected — handing off to Python"
-            break
+        else
+            bashio::log.info "Device not ready — retrying in 5s"
+            sleep 5
         fi
-        bashio::log.info "Device not ready (${OUTPUT##*$'\n'}) — retrying in 5s..."
-        sleep 5
     done
 else
     bashio::log.info "No MAC known yet — Python will handle first-run discovery"
