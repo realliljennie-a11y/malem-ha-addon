@@ -1,6 +1,6 @@
 # Malem Alarm — Home Assistant Add-on
 
-A Home Assistant add-on that integrates the **Malem wireless bedwetting alarm** as a native moisture sensor. The Malem app stopped receiving updates around 2015 and no longer installs on modern Android, but the BLE sensor hardware still works perfectly. This add-on reverse-engineers the proprietary BLE protocol to bring it into Home Assistant.
+A Home Assistant add-on that integrates the **Malem Blue-T wireless bedwetting alarm** as a native moisture sensor. The Malem app stopped receiving updates around 2016 and no longer installs on modern Android (I don't know about the iOS version), but the BLE sensor hardware still works perfectly. This add-on reverse-engineers the proprietary BLE protocol to bring it into Home Assistant.
 
 ## Requirements
 
@@ -25,7 +25,7 @@ A Home Assistant add-on that integrates the **Malem wireless bedwetting alarm** 
 | `mqtt_username` | _(empty)_ | MQTT username |
 | `mqtt_password` | _(empty)_ | MQTT password |
 | `mqtt_topic_prefix` | `malem` | Topic prefix (change to customize or if running multiple sensors) |
-| `sensor_mac` | _(empty)_ | MAC address of sensor device (autofilled after first attempt but change to override) |
+| `sensor_mac` | _(empty)_ | MAC address of sensor device (cached after first attempt but can change to override) |
 | `dry_timeout` | `15` | Seconds to wait before declaring dry if 0xAC is missed |
 | `log_level` | `info` | Logging verbosity: debug / info / warning / error |
 
@@ -49,6 +49,10 @@ The Malem sensor uses a proprietary BLE protocol over a custom service (`0xfff0`
 | `0xAC` | Dry, event ended — `byte[1] × 5` = duration in seconds |
 
 The authentication key table and magic bytes were extracted from the decompiled original Android APK.
+
+## Cache file
+
+There is a cache file, /config/malem_state.json, where the script stores the MAC address(ses) of the device(s) in order to speed up discovery.
 
 ## Multiple sensors
 
