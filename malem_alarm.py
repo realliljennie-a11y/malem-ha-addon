@@ -263,20 +263,37 @@ async def scan_for_device(address: str):
     return result[0]
 
 
-async def connect_and_auth(address: str) -> BleakClient:
+async def connect_and_auth(address: str, cache_warmed: bool = False) -> BleakClient:
     """
-    Connect and authenticate concurrently.
+    Connect and authenticate.
 
-    client.connect() blocks until BlueZ service discovery completes (3-8s).
-    The Malem device drops the connection after ~3s without auth.
-    So we run connect() as a background task, poll until the BLE link is
-    established, wait for BlueZ to register GATT objects, auth immediately,
-    then let discovery finish in the background.
+    If cache_warmed=False (first attempt): let connect() run normally so
+    BlueZ can complete service discovery and populate its cache. This attempt
+    will likely fail (device drops connection after 3s) but it warms the cache
+    for all subsequent attempts.
+
+    If cache_warmed=True: BlueZ has the cache, so GATT objects appear quickly.
+    Run connect() as a background task, poll until GATT objects are ready,
+    auth immediately, then let discovery finish in the background.
     """
     ble_device = await scan_for_device(address)
-    log.info(f"Connecting to {address}...")
+    log.info(f"Connecting to {address}... (cache_warmed={cache_warmed})")
 
     client = BleakClient(ble_device, timeout=15.0)
+
+    if not cache_warmed:
+        # First attempt: let BlueZ do full discovery to warm the cache.
+        # This will likely fail because the device disconnects before discovery
+        # completes, but it populates the BlueZ service cache for next time.
+        log.info("Warming BlueZ cache — discovery will run, auth may fail this attempt")
+        try:
+            await asyncio.wait_for(
+                client.connect(dangerous_use_bleak_cache=False),
+                timeout=12.0
+            )
+        except Exception as e:
+            log.info(f"Cache warm attempt: {e} (expected if device disconnected)")
+        raise BleakError("Authentication failed")  # force retry with warm cache
 
     # Start connect as background task — it blocks on service discovery
     connect_task = asyncio.ensure_future(
@@ -638,11 +655,13 @@ async def main():
     disc_failures = 0
     auth_failures = 0
     first_disc_failure_time = None
+    cache_warmed = False  # True after first successful or attempted discovery
 
     while True:
         client = None
         try:
-            client = await connect_and_auth(address)
+            client = await connect_and_auth(address, cache_warmed)
+            cache_warmed = True  # discovery has run at least once
             disc_failures = 0
             auth_failures = 0
             first_disc_failure_time = None
@@ -674,6 +693,7 @@ async def main():
             log.error(f"BLE error: {e}")
 
             if "failed to discover services" in err:
+                cache_warmed = True  # discovery ran even if it failed
                 disc_failures += 1
                 if first_disc_failure_time is None:
                     first_disc_failure_time = time.monotonic()
@@ -690,6 +710,7 @@ async def main():
                     await asyncio.sleep(3)
 
             elif "Authentication failed" in err:
+                cache_warmed = True  # connection reached auth stage, discovery ran
                 auth_failures += 1
                 if auth_failures % 6 == 0:
                     log.warning(f"Auth failure {auth_failures} — resetting adapter")

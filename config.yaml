@@ -1,6 +1,6 @@
 name: "Malem Alarm"
 description: "Listener for Malem BLUE-T BLE bedwetting sensor"
-version: "1.5.1"
+version: "1.5.2"
 slug: "malem_alarm"
 init: false
 arch:
