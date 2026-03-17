@@ -263,53 +263,72 @@ async def scan_for_device(address: str):
     return result[0]
 
 
+async def is_already_connected(address: str) -> bool:
+    """Check if BlueZ already has an active connection to this device."""
+    try:
+        from bleak.backends.bluezdbus.manager import get_global_bluez_manager
+        manager = await get_global_bluez_manager()
+        mac_nodash = address.upper().replace(":", "_")
+        adapter_path = manager.get_default_adapter()
+        device_path = f"{adapter_path}/dev_{mac_nodash}"
+        return manager.is_connected(device_path)
+    except Exception:
+        return False
+
+
 async def connect_and_auth(address: str, cache_warmed: bool = False) -> BleakClient:
     """
     Connect and authenticate.
 
-    run.sh pre-connects via bluetoothctl which completes service discovery
-    in ~1s and leaves services in BlueZ's in-memory cache. We then connect
-    with dangerous_use_bleak_cache=True which returns instantly, and auth
-    via hardcoded D-Bus paths.
+    run.sh pre-connects via bluetoothctl (1.26s) and leaves the connection
+    open. We detect the existing connection and attach to it — BlueZ skips
+    the BLE connect step and service discovery is instant since it already
+    happened. Auth via hardcoded D-Bus paths completes in ~0.1s.
 
-    If the cache is cold (first run or after adapter reset), we fall back
-    to the concurrent auth approach.
+    On reconnect (after disconnect), falls back to concurrent auth approach.
     """
+    # Check if bluetoothctl left us a live connection
+    already_connected = await is_already_connected(address)
+    if already_connected:
+        log.info(f"Device already connected via bluetoothctl — attaching...")
+
     ble_device = await scan_for_device(address)
     log.info(f"Connecting to {address}...")
 
     client = BleakClient(ble_device, timeout=15.0)
 
-    # Try sequential approach first — fast if BlueZ cache is warm
-    try:
-        await asyncio.wait_for(
-            client.connect(dangerous_use_bleak_cache=True),
-            timeout=4.0
-        )
-        if client.is_connected:
-            log.info("Connected (cache hit)")
-            if await auth_via_dbus(client, address):
-                return client
-            await client.disconnect()
-            raise BleakError("Authentication failed")
-    except asyncio.TimeoutError:
-        log.info("Sequential connect timed out — trying concurrent auth approach")
-        if client.is_connected:
-            await client.disconnect()
-    except BleakError as e:
-        if "Authentication failed" in str(e):
-            raise
-        log.info(f"Sequential connect: {e} — trying concurrent auth approach")
-        if client.is_connected:
-            await client.disconnect()
+    if already_connected:
+        # Attach to existing connection — connect() sees device is already
+        # connected and skips the BLE Connect call, going straight to
+        # service lookup which is instant.
+        try:
+            await asyncio.wait_for(
+                client.connect(dangerous_use_bleak_cache=True),
+                timeout=5.0
+            )
+            if client.is_connected:
+                log.info("Attached to existing connection")
+                if await auth_via_dbus(client, address):
+                    return client
+                await client.disconnect()
+                raise BleakError("Authentication failed")
+        except asyncio.TimeoutError:
+            log.warning("Attach timed out — falling through to fresh connect")
+            if client.is_connected:
+                await client.disconnect()
+        except BleakError as e:
+            if "Authentication failed" in str(e):
+                raise
+            log.warning(f"Attach failed: {e} — falling through to fresh connect")
+            if client.is_connected:
+                await client.disconnect()
 
-    # Cache miss — use concurrent auth approach
-    # Re-scan to get fresh BLEDevice
+    # Fresh connect — use concurrent auth approach
     ble_device = await scan_for_device(address)
     client = BleakClient(ble_device, timeout=15.0)
 
     connect_task = asyncio.ensure_future(
-        client.connect(dangerous_use_bleak_cache=False)
+        client.connect(dangerous_use_bleak_cache=True)
     )
 
     auth_ok = False

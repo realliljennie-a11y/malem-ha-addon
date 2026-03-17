@@ -13,13 +13,10 @@ bashio::log.info "Starting Malem BlueT listener..."
 bashio::log.info "MQTT: ${MQTT_HOST}:${MQTT_PORT}, prefix: ${MQTT_TOPIC_PREFIX}"
 
 # ── Pre-connect via bluetoothctl ──────────────────────────────────────────────
-# bluetoothctl completes service discovery in ~1s (vs 8s+ for bleak).
-# By connecting here first, BlueZ caches the services in memory.
-# The Python script then connects to an already-known device and auth
-# succeeds immediately.
-#
-# We do this for the known MAC if available, otherwise Python handles
-# first-run discovery.
+# bluetoothctl completes service discovery in ~1s. We connect and leave the
+# connection open. Python then attaches to the already-connected device —
+# BlueZ skips the "Connect" D-Bus call and goes straight to service lookup
+# which is instant since discovery already happened.
 
 SENSOR_MAC_RESOLVED=""
 if [ -n "$SENSOR_MAC" ]; then
@@ -29,15 +26,14 @@ elif [ -f "/config/malem_state.json" ]; then
 fi
 
 if [ -n "$SENSOR_MAC_RESOLVED" ]; then
-    bashio::log.info "Pre-connecting via bluetoothctl to warm BlueZ cache..."
-    # Connect and immediately disconnect — we just need service discovery to run
+    bashio::log.info "Pre-connecting via bluetoothctl..."
     bluetoothctl connect "$SENSOR_MAC_RESOLVED" 2>/dev/null || true
-    sleep 0.5
-    bluetoothctl disconnect "$SENSOR_MAC_RESOLVED" 2>/dev/null || true
-    sleep 0.5
-    bashio::log.info "BlueZ cache warmed"
+    # Leave connected — Python will attach to existing connection
+    # Give BlueZ a moment to finish registering GATT objects
+    sleep 1
+    bashio::log.info "Pre-connect done — handing off to Python"
 else
-    bashio::log.info "No MAC known yet — skipping pre-connect"
+    bashio::log.info "No MAC known yet — Python will handle first-run discovery"
 fi
 
 exec python3 /app/malem_bluet.py
