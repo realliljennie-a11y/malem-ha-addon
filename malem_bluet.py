@@ -289,18 +289,22 @@ async def connect_and_auth(address: str, cache_warmed: bool = False) -> BleakCli
     """
     # Check if bluetoothctl left us a live connection
     already_connected = await is_already_connected(address)
-    if already_connected:
-        log.info(f"Device already connected via bluetoothctl — attaching...")
-
-    ble_device = await scan_for_device(address)
-    log.info(f"Connecting to {address}...")
-
-    client = BleakClient(ble_device, timeout=15.0)
 
     if already_connected:
-        # Attach to existing connection — connect() sees device is already
-        # connected and skips the BLE Connect call, going straight to
-        # service lookup which is instant.
+        log.info("Device already connected — attaching immediately (no scan needed)...")
+        # Build BLEDevice directly from known MAC — no scan needed since
+        # BlueZ already has the device registered from bluetoothctl
+        from bleak.backends.device import BLEDevice
+        mac_nodash = address.upper().replace(":", "_")
+        adapter_path = "/org/bluez/hci0"
+        device_path = f"{adapter_path}/dev_{mac_nodash}"
+        ble_device = BLEDevice(
+            address=address,
+            name=DEVICE_NAME,
+            details={"path": device_path, "props": {}},
+            rssi=-60,
+        )
+        client = BleakClient(ble_device, timeout=5.0)
         try:
             await asyncio.wait_for(
                 client.connect(dangerous_use_bleak_cache=True),
@@ -315,15 +319,21 @@ async def connect_and_auth(address: str, cache_warmed: bool = False) -> BleakCli
         except asyncio.TimeoutError:
             log.warning("Attach timed out — falling through to fresh connect")
             if client.is_connected:
-                await client.disconnect()
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
         except BleakError as e:
             if "Authentication failed" in str(e):
                 raise
             log.warning(f"Attach failed: {e} — falling through to fresh connect")
             if client.is_connected:
-                await client.disconnect()
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
 
-    # Fresh connect — use concurrent auth approach
+    # Fresh connect — scan first then use concurrent auth approach
     ble_device = await scan_for_device(address)
     client = BleakClient(ble_device, timeout=15.0)
 
